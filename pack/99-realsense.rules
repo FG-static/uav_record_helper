@@ -1,0 +1,7 @@
+# D400 系列（含 D435i）用户态访问。复制到 /etc/udev/rules.d/ 后：
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# 或直接装 Intel 的 librealsense 包，它会带更完整的规则。
+SUBSYSTEM=="usb", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b3a", MODE="0666"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b07", MODE="0666"
+KERNEL=="hidraw*", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b3a", MODE="0666"
+KERNEL=="hidraw*", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b07", MODE="0666"
