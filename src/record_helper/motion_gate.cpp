@@ -350,7 +350,7 @@ LiveGateStatus LiveGate::Assess(std::size_t static_needed, std::size_t motion_ne
     if (status.too_aggressive) {
         status.hint = "运动过猛：请放慢平移与转动，避免丢点与运动模糊";
     } else if (!status.static_run_met) {
-        status.hint = "把设备平放不动，让加速度计和陀螺的窗口抖动降到阈值以下";
+        status.hint = "把设备镜头朝上平放不动，让加速度计和陀螺的窗口抖动降到阈值以下";
     } else if (!status.motion_run_met) {
         status.hint = "缓慢平移 30~50 cm 并小幅偏航/俯仰，持续 3 s 以上";
     } else {

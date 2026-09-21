@@ -7,6 +7,10 @@
 #include "record_helper/calibration.hpp"
 #include "record_helper/types.hpp"
 
+namespace rs2 {
+class frame;
+}
+
 namespace rh::capture {
 
 struct StreamConfig {
@@ -52,9 +56,10 @@ struct Handlers {
 };
 
 struct SessionStats {
-    std::uint64_t framesets{0};
     std::uint64_t pairs{0};
     std::uint64_t unpaired{0};
+    // 逐帧回调队列写满时被丢弃的帧数：调用方长时间不进 Step() 才会发生。
+    std::uint64_t dropped{0};
     std::uint64_t gyro{0};
     std::uint64_t accel{0};
     std::uint64_t depth{0};
@@ -96,6 +101,12 @@ class Session {
     Handlers handlers_;
     SessionStats stats_;
     bool running_{false};
+
+    // 逐帧回调只入队，派发都在调用方线程：左右目靠时间戳全等配对，所以先到的一方要能挂住等另一半。
+    void DispatchFrame(const rs2::frame& frame);
+    void HoldForPair(const rs2::frame& frame, TimeNs stamp, bool left);
+    void EmitPair(const rs2::frame& left, const rs2::frame& right);
+    void EmitDepth(const rs2::frame& depth);
 };
 
 // 把设备报告的 3x4 外参转成 RigidTransform，并做正交化修正（p_to = R·p_from + t）。

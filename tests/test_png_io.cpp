@@ -3,6 +3,7 @@
 #include "record_helper/png_io.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 

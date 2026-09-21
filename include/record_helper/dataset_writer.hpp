@@ -45,6 +45,8 @@ struct Provenance {
     std::string distortion_model0;
     std::string distortion_model1;
     std::string capture_note;
+    // 静止标定阶段实测：平均比力与 T_BS 第三列的夹角（度）。<0 = 没测成。见 CheckGravityDirection。
+    double static_gravity_angle_deg{-1.0};
     int camera_fps{30};
     int imu_gyro_hz{400};
 };

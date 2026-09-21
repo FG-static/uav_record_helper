@@ -20,6 +20,33 @@ namespace {
 
 enum class Phase { Preflight, Still, Excite, Track, Tail, Finalizing, Aborted };
 
+// 静止标定阶段允许设备摆得不那么水平；容差要宽到不误伤手摆，又窄到能抓住 90°/180° 的口径错。
+constexpr double kGravityDirectionToleranceDeg = 25.0;
+
+// 按「记录系 = 光学系」（x 右、y 下、z 朝镜头外）把静止段实测的世界上翻译成摆法，
+// 好让中止信息说得出「你现在是怎么放的」，而不只是丢一个夹角。
+const char* StillPoseHint(const Eigen::Vector3d& up) {
+    if (up.z() > 0.8) {
+        return "镜头竖直朝上（就是本阶段要求的摆法）";
+    }
+    if (up.z() < -0.8) {
+        return "镜头朝下扣在桌上";
+    }
+    if (up.y() < -0.8) {
+        return "镜头水平朝前、画面正立";
+    }
+    if (up.y() > 0.8) {
+        return "镜头水平朝前、画面倒立";
+    }
+    if (up.x() < -0.8) {
+        return "侧躺、画面里左边朝上";
+    }
+    if (up.x() > 0.8) {
+        return "侧躺、画面里右边朝上";
+    }
+    return "斜放，没对准任何一根轴";
+}
+
 const char* PhaseName(Phase phase) {
     switch (phase) {
     case Phase::Preflight:
@@ -187,6 +214,8 @@ int RunRecord(int argc, char** argv) {
     std::unique_ptr<DatasetWriter> writer;
     ImuNoise noise;
     NoiseEstimate noise_estimate;
+    // 静止段实测重力方向与 T_BS 第三列的夹角；<0 表示没测成。写进 record_summary.yaml 留痕。
+    double static_gravity_angle_deg = -1.0;
     TimeNs latest_imu_ns = 0;
     TimeNs gate_last_ns = 0;
 
@@ -214,6 +243,7 @@ int RunRecord(int argc, char** argv) {
         provenance.capture_note =
             "still=" + std::to_string(static_cast<int>(still_seconds * 10) / 10.0) +
             "s excite=" + std::to_string(static_cast<int>(excite_seconds * 10) / 10.0) + "s";
+        provenance.static_gravity_angle_deg = static_gravity_angle_deg;
         auto created =
             std::make_unique<DatasetWriter>(root, info.calibration, noise, options, provenance);
         if (!created->Start(failure)) {
@@ -354,8 +384,8 @@ int RunRecord(int argc, char** argv) {
             if (session.stats().pairs > 3 && gyro.size() > 20 && accel.size() > 10) {
                 phase = Phase::Still;
                 phase_started = MonotonicSeconds();
-                std::printf("\n阶段 %s：请把设备平放在桌上完全不动约 %.0f s（当前 "
-                            "accel_rms=%.3f gyro_rms=%.3f）\n",
+                std::printf("\n阶段 %s：请把设备「镜头竖直朝上」平放桌上、完全不动约 %.0f s"
+                            "（当前 accel_rms=%.3f gyro_rms=%.3f）\n",
                             PhaseName(phase),
                             still_seconds,
                             gate_status.last_accel_rms,
@@ -392,6 +422,49 @@ int RunRecord(int argc, char** argv) {
                     std::printf(
                         "  警告: 静止 ‖a‖ 与 9.81 偏差 %.3f m/s²，零速假设可能被初始化拒绝\n",
                         gravity.error);
+                }
+                // 本阶段设备是平放、镜头朝上的，所以世界上 = 光学 +z：静止段平均比力必须沿
+                // T_BS 第三列。模长好看而方向不对，就是 IMU 数据系与外参表口径不一致。
+                Eigen::Vector3d static_mean = Eigen::Vector3d::Zero();
+                if (static_samples > 0) {
+                    static_mean = static_sum / static_cast<double>(static_samples);
+                }
+                const auto direction = cal::CheckGravityDirection(
+                    static_mean, info.calibration.camera0_to_body.r, kGravityDirectionToleranceDeg);
+                static_gravity_angle_deg = direction.measured_valid ? direction.angle_deg : -1.0;
+                if (!direction.measured_valid) {
+                    std::printf("  警告: 静止段样本不足，没能核对重力方向与 T_BS 第三列\n");
+                } else {
+                    const Eigen::Vector3d up = direction.measured.normalized();
+                    std::printf("  重力方向核对: 静止均值 (%+.3f, %+.3f, %+.3f)，世界上 = 记录系 "
+                                "(%+.2f, %+.2f, %+.2f)，与 T_BS 第三列 (%+.3f, %+.3f, %+.3f) "
+                                "夹角 %.1f°（容差 %.0f°）\n",
+                                static_mean.x(),
+                                static_mean.y(),
+                                static_mean.z(),
+                                up.x(),
+                                up.y(),
+                                up.z(),
+                                direction.expected.x(),
+                                direction.expected.y(),
+                                direction.expected.z(),
+                                direction.angle_deg,
+                                kGravityDirectionToleranceDeg);
+                    if (!direction.pass) {
+                        std::printf(
+                            "  中止: 本阶段要求「镜头竖直朝上」，此时世界上应是 (0, 0, +1)；"
+                            "实测是 (%+.2f, %+.2f, %+.2f) → %s。\n"
+                            "        按提示重摆再跑即可（还没写盘，不占空间）。\n"
+                            "        若确认已镜头朝上而夹角仍在 90°/180° 附近，那才是加表数据系与\n"
+                            "        外参表口径不一致——换过 SDK 构建、后端或内核驱动会这样；此时照抄\n"
+                            "        设备外参写出的 T_BS 是错的，要先修口径再录。\n",
+                            up.x(),
+                            up.y(),
+                            up.z(),
+                            StillPoseHint(up));
+                        phase = Phase::Aborted;
+                        break;
+                    }
                 }
                 if (!open_writer(&error)) {
                     std::printf("无法写出到 %s: %s\n", root.c_str(), error.c_str());

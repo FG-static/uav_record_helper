@@ -107,13 +107,14 @@ int RunProbe(int argc, char** argv) {
         return 1;
     }
     const double started = MonotonicSeconds();
-    while (session.stats().framesets < static_cast<std::uint64_t>(config.probe_frames) &&
+    while (session.stats().pairs < static_cast<std::uint64_t>(config.probe_frames) &&
            MonotonicSeconds() - started < 8.0) {
         if (!session.Step(&error)) {
             std::printf("取帧失败: %s\n", error.c_str());
             break;
         }
     }
+    const double sampled_seconds = MonotonicSeconds() - started;
     session.Stop();
 
     const auto& stats = session.stats();
@@ -179,10 +180,10 @@ int RunProbe(int argc, char** argv) {
     }
 
     std::printf("\n== 时间戳与同步 ==\n");
-    std::printf("  framesets=%llu pairs=%llu 未配对=%llu 左右偏斜最大=%.4f ms\n",
-                static_cast<unsigned long long>(stats.framesets),
+    std::printf("  pairs=%llu 未配对=%llu 队列丢弃=%llu 左右偏斜最大=%.4f ms\n",
                 static_cast<unsigned long long>(stats.pairs),
                 static_cast<unsigned long long>(stats.unpaired),
+                static_cast<unsigned long long>(stats.dropped),
                 stats.max_stereo_skew_ms);
     std::printf("  SENSOR_TIMESTAMP 元数据与 get_timestamp() 最大偏差=%.6f ms\n",
                 stats.max_timestamp_agreement_ms);
@@ -199,12 +200,33 @@ int RunProbe(int argc, char** argv) {
                     "会让静止初始化失败）\n",
                     sum.norm() / static_cast<double>(accel.size()));
     }
-    std::printf("  gyro 样本=%llu accel 样本=%llu（比例应约等于 %.0f/%.0f）\n",
+    // IMU 必须按标称速率到达。取帧接口用错（例如按 frameset 取，一个 frameset 每流最多一帧）
+    // 会把它抽稀到相机帧率：imu0 栅格间隔立刻超上游的 10 ms 上限，而其余检查全都照过。
+    const double gyro_hz =
+        sampled_seconds > 0.0 ? static_cast<double>(stats.gyro) / sampled_seconds : 0.0;
+    const double accel_hz =
+        sampled_seconds > 0.0 ? static_cast<double>(stats.accel) / sampled_seconds : 0.0;
+    std::printf("  实测采样率 gyro=%.0f Hz accel=%.0f Hz（请求 %.0f/%.0f Hz，样本 %llu/%llu，窗口 %.2f s）\n",
+                gyro_hz,
+                accel_hz,
+                info.gyro_hz > 0.0 ? info.gyro_hz : 1.0,
+                info.accel_hz > 0.0 ? info.accel_hz : 1.0,
                 static_cast<unsigned long long>(stats.gyro),
                 static_cast<unsigned long long>(stats.accel),
-                info.gyro_hz > 0.0 ? info.gyro_hz : 1.0,
-                info.accel_hz > 0.0 ? info.accel_hz : 1.0);
-    return 0;
+                sampled_seconds);
+    int status = 0;
+    const auto require_rate = [&](const char* name, double measured, double requested) {
+        if (requested <= 0.0 || measured >= 0.8 * requested) {
+            return;
+        }
+        std::printf("  [FAIL] %s 实测只有请求值的 %.0f%%：IMU 被抽稀，栅格间隔会超 10 ms 上限\n",
+                    name,
+                    100.0 * measured / requested);
+        status = 1;
+    };
+    require_rate("gyro", gyro_hz, info.gyro_hz);
+    require_rate("accel", accel_hz, info.accel_hz);
+    return status;
 }
 
 } // namespace rh::cli

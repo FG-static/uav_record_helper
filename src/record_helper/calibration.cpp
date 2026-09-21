@@ -203,4 +203,25 @@ GravityCheck CheckGravity(double mean_accel_norm, double expected_g, double tole
     return check;
 }
 
+GravityDirectionCheck CheckGravityDirection(const Eigen::Vector3d& mean_accel,
+                                            const Eigen::Matrix3d& camera_to_body_rotation,
+                                            double tolerance_deg) {
+    GravityDirectionCheck check;
+    check.measured = mean_accel;
+    check.expected = camera_to_body_rotation.col(2);
+    const double measured_norm = mean_accel.norm();
+    const double expected_norm = check.expected.norm();
+    // 静止段一个样本都没有（或外参退化）时不下结论，交给调用方按「未测」处理。
+    if (!Finite(mean_accel) || !Finite(check.expected) || measured_norm < 1.0 ||
+        expected_norm < 1e-6) {
+        return check;
+    }
+    check.measured_valid = true;
+    const double cosine = std::max(
+        -1.0, std::min(1.0, mean_accel.dot(check.expected) / (measured_norm * expected_norm)));
+    check.angle_deg = std::acos(cosine) * 180.0 / M_PI;
+    check.pass = check.angle_deg <= tolerance_deg;
+    return check;
+}
+
 } // namespace rh::cal

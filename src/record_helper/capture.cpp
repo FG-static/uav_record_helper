@@ -1,15 +1,26 @@
 #include "record_helper/capture.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <limits>
+#include <mutex>
+#include <optional>
 #include <string>
 
 #include <librealsense2/rs.hpp>
 
 namespace rh::capture {
 namespace {
+
+// 逐帧队列上限。满约 6 s 的 IMU 加几百对双目帧的在途量；再深就说明调用方已经卡死，
+// 继续堆只会吃内存，不如丢掉并计入 stats_.dropped。
+constexpr std::size_t kQueueCap = 4096;
+// Step() 单次最多派发多少帧，保证状态行刷新不被一次积压堵死。
+constexpr std::size_t kStepBatch = 128;
 
 TimeNs FrameNs(const rs2::frame& frame) {
     // get_timestamp() 统一是毫秒（设备单调时钟域），乘 1e6 归到纳秒。
@@ -215,6 +226,18 @@ struct Session::Impl {
     bool has_depth{false};
     RigidTransform camera0_to_body;
     std::uint64_t last_pose_frame{0};
+
+    // 逐帧回调投递到这里，由 Step() 在调用方线程派发。用 pipeline 的 frameset 接口取帧会把
+    // 400/250 Hz 的 IMU 抽稀到相机帧率（一个 frameset 每流最多一帧），IMU 栅格直接超 10 ms。
+    std::mutex queue_mutex;
+    std::condition_variable queue_cv;
+    std::deque<rs2::frame> queue;
+
+    // 左右目改由时间戳全等自行配对（D400 硬件同步，两目共享同一个曝光时间戳）。
+    std::optional<rs2::frame> pending_left;
+    std::optional<rs2::frame> pending_right;
+    TimeNs pending_left_ns{0};
+    TimeNs pending_right_ns{0};
 };
 
 Session::Session() : impl_(new Impl()) {}
@@ -402,8 +425,19 @@ bool Session::Start(const StreamConfig& config,
 
         delete impl_->pipeline;
         impl_->pipeline = new rs2::pipeline(impl_->context);
+        // 带回调启动 = 逐帧交付，IMU 才能跑到 400/250 Hz；此时 wait_for_frames()/poll_for_frames()
+        // 会抛异常，所以帧一律先进队列，由 Step() 在调用方线程派发。
+        auto pump = [this](rs2::frame frame) {
+            std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+            if (impl_->queue.size() < kQueueCap) {
+                impl_->queue.push_back(std::move(frame));
+                impl_->queue_cv.notify_one();
+            } else {
+                ++stats_.dropped;
+            }
+        };
         try {
-            impl_->profile = impl_->pipeline->start(pipeline_config);
+            impl_->profile = impl_->pipeline->start(pipeline_config, pump);
         } catch (const rs2::error& e) {
             if (!impl_->has_pose) {
                 throw;
@@ -436,7 +470,7 @@ bool Session::Start(const StreamConfig& config,
                                        depth_video.fps());
                 impl_->has_depth = true;
             }
-            impl_->profile = impl_->pipeline->start(fallback);
+            impl_->profile = impl_->pipeline->start(fallback, pump);
             if (error != nullptr) {
                 *error = std::string("pose 流启动失败，已按无伪 GT 继续：") + DescribeError(e);
             }
@@ -522,14 +556,20 @@ void Session::Stop() {
     if (impl_ == nullptr) {
         return;
     }
+    running_ = false;
     if (impl_->pipeline != nullptr) {
         try {
+            // pipeline::stop() 会等回调线程收尾，返回后不会再有帧投递进来。
             impl_->pipeline->stop();
         } catch (...) {
             // 停止阶段的异常不能覆盖已经落盘的数据集。
         }
     }
-    running_ = false;
+    impl_->queue_cv.notify_all();
+    std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+    impl_->queue.clear();
+    impl_->pending_left.reset();
+    impl_->pending_right.reset();
 }
 
 bool Session::Step(std::string* error) {
@@ -539,160 +579,197 @@ bool Session::Step(std::string* error) {
         }
         return false;
     }
-    rs2::frameset frames;
+    std::vector<rs2::frame> batch;
+    {
+        std::unique_lock<std::mutex> lock(impl_->queue_mutex);
+        if (impl_->queue.empty()) {
+            // 帧由回调线程投递。这里等一小会儿而不是空转，语义等同旧的 wait_for_frames(200)。
+            impl_->queue_cv.wait_for(lock, std::chrono::milliseconds(20), [this] {
+                return !impl_->queue.empty() || !running_;
+            });
+        }
+        while (!impl_->queue.empty() && batch.size() < kStepBatch) {
+            batch.push_back(std::move(impl_->queue.front()));
+            impl_->queue.pop_front();
+        }
+    }
     try {
-        frames = impl_->pipeline->wait_for_frames(200);
+        for (std::size_t i = 0; i < batch.size(); ++i) {
+            DispatchFrame(batch[i]);
+        }
     } catch (const rs2::error& e) {
         if (error != nullptr) {
             *error = DescribeError(e);
         }
         return false;
     }
-    if (!frames) {
-        return true; // 超时但没有错误：由调用方决定等待预算
-    }
-    ++stats_.framesets;
-
-    rs2::frame left;
-    rs2::frame right;
-    rs2::frame depth;
-    for (std::size_t index = 0; index < frames.size(); ++index) {
-        const rs2::frame frame = frames[index];
-        const rs2::stream_profile profile = frame.get_profile();
-        bool metadata_available = false;
-        const double metadata_ns = MetadataNs(frame, &metadata_available);
-        const TimeNs stamp = FrameNs(frame);
-        if (metadata_available) {
-            stats_.max_timestamp_agreement_ms =
-                std::max(stats_.max_timestamp_agreement_ms,
-                         std::abs(metadata_ns - static_cast<double>(stamp)) * 1e-6);
-        }
-        switch (profile.stream_type()) {
-        case RS2_STREAM_INFRARED:
-            if (profile.stream_index() == 1) {
-                left = frame;
-            } else if (profile.stream_index() == 2) {
-                right = frame;
-            }
-            break;
-        case RS2_STREAM_DEPTH:
-            depth = frame;
-            break;
-        case RS2_STREAM_GYRO: {
-            const rs2_vector data = frame.as<rs2::motion_frame>().get_motion_data();
-            GyroSample sample;
-            sample.t_ns = stamp;
-            sample.w = Eigen::Vector3d(data.x, data.y, data.z);
-            ++stats_.gyro;
-            if (handlers_.on_gyro) {
-                handlers_.on_gyro(sample);
-            }
-            break;
-        }
-        case RS2_STREAM_ACCEL: {
-            const rs2_vector data = frame.as<rs2::motion_frame>().get_motion_data();
-            AccelSample sample;
-            sample.t_ns = stamp;
-            sample.a = Eigen::Vector3d(data.x, data.y, data.z);
-            ++stats_.accel;
-            if (handlers_.on_accel) {
-                handlers_.on_accel(sample);
-            }
-            break;
-        }
-        case RS2_STREAM_POSE: {
-            if (!handlers_.on_pose) {
-                break;
-            }
-            const rs2_pose pose = frame.as<rs2::pose_frame>().get_pose_data();
-            PoseRecord record;
-            record.t_ns = stamp;
-            // 位姿流给的是 world←camera0；再套一次 camera0→body 外参得到 world←body。
-            const rs2::stream_profile pose_stream = impl_->profile.get_stream(RS2_STREAM_POSE);
-            const rs2_extrinsics cam0_from_pose =
-                impl_->cam0_profile.get_extrinsics_to(pose_stream);
-            const RigidTransform pose_to_cam0 =
-                cal::Invert(TransformFromRs2(cam0_from_pose.rotation, cam0_from_pose.translation));
-            RigidTransform world_to_cam0;
-            world_to_cam0.r =
-                Eigen::Quaterniond(
-                    pose.rotation.w, pose.rotation.x, pose.rotation.y, pose.rotation.z)
-                    .normalized()
-                    .toRotationMatrix();
-            world_to_cam0.t =
-                Eigen::Vector3d(pose.translation.x, pose.translation.y, pose.translation.z);
-            const RigidTransform world_to_body = cal::Compose(pose_to_cam0, world_to_cam0);
-            record.p = world_to_body.t;
-            record.q = Eigen::Quaterniond(world_to_body.r).normalized();
-            record.confidence = static_cast<double>(pose.tracker_confidence);
-            ++stats_.pose;
-            handlers_.on_pose(record);
-            break;
-        }
-        default:
-            break;
-        }
-    }
-
-    if (left && right) {
-        const rs2::video_frame left_video = left.as<rs2::video_frame>();
-        const rs2::video_frame right_video = right.as<rs2::video_frame>();
-        if (left_video.get_frame_number() != right_video.get_frame_number()) {
-            ++stats_.unpaired;
-        } else {
-            StereoPairRecord record;
-            record.frame_counter0 = left_video.get_frame_number();
-            record.frame_counter1 = right_video.get_frame_number();
-            const TimeNs left_ns = FrameNs(left);
-            record.t_ns = left_ns; // Camera0 是共享曝光时间的权威时间戳
-            record.t1_ns = FrameNs(right);
-            const double skew_ms = std::abs(static_cast<double>(record.t_ns - record.t1_ns)) * 1e-6;
-            stats_.max_stereo_skew_ms = std::max(stats_.max_stereo_skew_ms, skew_ms);
-            const auto copy_gray = [](const rs2::video_frame& frame,
-                                      std::vector<std::uint8_t>* out) {
-                const int width = frame.get_width();
-                const int height = frame.get_height();
-                const int stride = frame.get_stride_in_bytes();
-                const auto* data = static_cast<const std::uint8_t*>(frame.get_data());
-                out->resize(static_cast<std::size_t>(width) * height);
-                for (int row = 0; row < height; ++row) {
-                    std::memcpy(out->data() + static_cast<std::size_t>(row) * width,
-                                data + static_cast<std::size_t>(row) * stride,
-                                static_cast<std::size_t>(width));
-                }
-            };
-            copy_gray(left_video, &record.left);
-            copy_gray(right_video, &record.right);
-            ++stats_.pairs;
-            if (handlers_.on_pair) {
-                handlers_.on_pair(std::move(record));
-            }
-        }
-    } else if (left || right) {
-        ++stats_.unpaired;
-    }
-
-    if (depth && handlers_.on_depth) {
-        const rs2::video_frame depth_video = depth.as<rs2::video_frame>();
-        DepthRecord record;
-        record.t_ns = FrameNs(depth);
-        record.width = static_cast<std::uint32_t>(depth_video.get_width());
-        record.height = static_cast<std::uint32_t>(depth_video.get_height());
-        const std::size_t pixels = static_cast<std::size_t>(record.width) * record.height;
-        record.millimetres.resize(pixels);
-        const int stride = depth_video.get_stride_in_bytes();
-        const auto* data = static_cast<const std::uint8_t*>(depth.get_data());
-        for (std::uint32_t row = 0; row < record.height; ++row) {
-            const auto* line = reinterpret_cast<const std::uint16_t*>(
-                data + static_cast<std::size_t>(row) * stride);
-            std::memcpy(record.millimetres.data() + static_cast<std::size_t>(row) * record.width,
-                        line,
-                        static_cast<std::size_t>(record.width) * sizeof(std::uint16_t));
-        }
-        ++stats_.depth;
-        handlers_.on_depth(std::move(record));
-    }
     return true;
+}
+
+// 回调投递的形状是混合的：两目（以及带 depth 时的三路视频流）仍按 frameset 成对到达，
+// gyro/accel 则是逐帧到达——逐帧才是 IMU 能跑满 400/250 Hz 的原因。所以 frameset 要就地展开，
+// 否则它会因为 get_profile() 不是某个具体流而掉进 default 被丢掉。
+void Session::DispatchFrame(const rs2::frame& frame) {
+    if (frame.is<rs2::frameset>()) {
+        const rs2::frameset frames = frame.as<rs2::frameset>();
+        for (std::size_t index = 0; index < frames.size(); ++index) {
+            DispatchFrame(frames[index]);
+        }
+        return;
+    }
+    const rs2::stream_profile profile = frame.get_profile();
+    bool metadata_available = false;
+    const double metadata_ns = MetadataNs(frame, &metadata_available);
+    const TimeNs stamp = FrameNs(frame);
+    if (metadata_available) {
+        stats_.max_timestamp_agreement_ms =
+            std::max(stats_.max_timestamp_agreement_ms,
+                     std::abs(metadata_ns - static_cast<double>(stamp)) * 1e-6);
+    }
+    switch (profile.stream_type()) {
+    case RS2_STREAM_INFRARED:
+        HoldForPair(frame, stamp, profile.stream_index() == 1);
+        break;
+    case RS2_STREAM_DEPTH:
+        EmitDepth(frame);
+        break;
+    case RS2_STREAM_GYRO: {
+        const rs2_vector data = frame.as<rs2::motion_frame>().get_motion_data();
+        GyroSample sample;
+        sample.t_ns = stamp;
+        sample.w = Eigen::Vector3d(data.x, data.y, data.z);
+        ++stats_.gyro;
+        if (handlers_.on_gyro) {
+            handlers_.on_gyro(sample);
+        }
+        break;
+    }
+    case RS2_STREAM_ACCEL: {
+        const rs2_vector data = frame.as<rs2::motion_frame>().get_motion_data();
+        AccelSample sample;
+        sample.t_ns = stamp;
+        sample.a = Eigen::Vector3d(data.x, data.y, data.z);
+        ++stats_.accel;
+        if (handlers_.on_accel) {
+            handlers_.on_accel(sample);
+        }
+        break;
+    }
+    case RS2_STREAM_POSE: {
+        if (!handlers_.on_pose) {
+            break;
+        }
+        const rs2_pose pose = frame.as<rs2::pose_frame>().get_pose_data();
+        PoseRecord record;
+        record.t_ns = stamp;
+        // 位姿流给的是 world←camera0；再套一次 camera0→body 外参得到 world←body。
+        const rs2::stream_profile pose_stream = impl_->profile.get_stream(RS2_STREAM_POSE);
+        const rs2_extrinsics cam0_from_pose = impl_->cam0_profile.get_extrinsics_to(pose_stream);
+        const RigidTransform pose_to_cam0 =
+            cal::Invert(TransformFromRs2(cam0_from_pose.rotation, cam0_from_pose.translation));
+        RigidTransform world_to_cam0;
+        world_to_cam0.r = Eigen::Quaterniond(
+                              pose.rotation.w, pose.rotation.x, pose.rotation.y, pose.rotation.z)
+                              .normalized()
+                              .toRotationMatrix();
+        world_to_cam0.t =
+            Eigen::Vector3d(pose.translation.x, pose.translation.y, pose.translation.z);
+        const RigidTransform world_to_body = cal::Compose(pose_to_cam0, world_to_cam0);
+        record.p = world_to_body.t;
+        record.q = Eigen::Quaterniond(world_to_body.r).normalized();
+        record.confidence = static_cast<double>(pose.tracker_confidence);
+        ++stats_.pose;
+        handlers_.on_pose(record);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// 两目按「曝光时间戳全等」配对：先到的一方等着，等到同刻的另一半才出对。两边时刻不同说明
+// 有一路真掉了——落后那条计 unpaired 后丢弃，宁可整对丢，也不给回放留错配（上游要求 ns 全等）。
+void Session::HoldForPair(const rs2::frame& frame, TimeNs stamp, bool left) {
+    if (left) {
+        impl_->pending_left = frame;
+        impl_->pending_left_ns = stamp;
+    } else {
+        impl_->pending_right = frame;
+        impl_->pending_right_ns = stamp;
+    }
+    if (!impl_->pending_left || !impl_->pending_right) {
+        return;
+    }
+    if (impl_->pending_left_ns != impl_->pending_right_ns) {
+        ++stats_.unpaired;
+        if (impl_->pending_left_ns < impl_->pending_right_ns) {
+            impl_->pending_left.reset();
+        } else {
+            impl_->pending_right.reset();
+        }
+        return;
+    }
+    EmitPair(*impl_->pending_left, *impl_->pending_right);
+    impl_->pending_left.reset();
+    impl_->pending_right.reset();
+}
+
+void Session::EmitPair(const rs2::frame& left, const rs2::frame& right) {
+    const rs2::video_frame left_video = left.as<rs2::video_frame>();
+    const rs2::video_frame right_video = right.as<rs2::video_frame>();
+    if (left_video.get_frame_number() != right_video.get_frame_number()) {
+        ++stats_.unpaired;
+        return;
+    }
+    StereoPairRecord record;
+    record.frame_counter0 = left_video.get_frame_number();
+    record.frame_counter1 = right_video.get_frame_number();
+    record.t_ns = FrameNs(left); // Camera0 是共享曝光时间的权威时间戳
+    record.t1_ns = FrameNs(right);
+    const double skew_ms = std::abs(static_cast<double>(record.t_ns - record.t1_ns)) * 1e-6;
+    stats_.max_stereo_skew_ms = std::max(stats_.max_stereo_skew_ms, skew_ms);
+    const auto copy_gray = [](const rs2::video_frame& frame, std::vector<std::uint8_t>* out) {
+        const int width = frame.get_width();
+        const int height = frame.get_height();
+        const int stride = frame.get_stride_in_bytes();
+        const auto* data = static_cast<const std::uint8_t*>(frame.get_data());
+        out->resize(static_cast<std::size_t>(width) * height);
+        for (int row = 0; row < height; ++row) {
+            std::memcpy(out->data() + static_cast<std::size_t>(row) * width,
+                        data + static_cast<std::size_t>(row) * stride,
+                        static_cast<std::size_t>(width));
+        }
+    };
+    copy_gray(left_video, &record.left);
+    copy_gray(right_video, &record.right);
+    ++stats_.pairs;
+    if (handlers_.on_pair) {
+        handlers_.on_pair(std::move(record));
+    }
+}
+
+void Session::EmitDepth(const rs2::frame& depth) {
+    if (!handlers_.on_depth) {
+        return;
+    }
+    const rs2::video_frame depth_video = depth.as<rs2::video_frame>();
+    DepthRecord record;
+    record.t_ns = FrameNs(depth);
+    record.width = static_cast<std::uint32_t>(depth_video.get_width());
+    record.height = static_cast<std::uint32_t>(depth_video.get_height());
+    const std::size_t pixels = static_cast<std::size_t>(record.width) * record.height;
+    record.millimetres.resize(pixels);
+    const int stride = depth_video.get_stride_in_bytes();
+    const auto* data = static_cast<const std::uint8_t*>(depth.get_data());
+    for (std::uint32_t row = 0; row < record.height; ++row) {
+        const auto* line =
+            reinterpret_cast<const std::uint16_t*>(data + static_cast<std::size_t>(row) * stride);
+        std::memcpy(record.millimetres.data() + static_cast<std::size_t>(row) * record.width,
+                    line,
+                    static_cast<std::size_t>(record.width) * sizeof(std::uint16_t));
+    }
+    ++stats_.depth;
+    handlers_.on_depth(std::move(record));
 }
 
 } // namespace rh::capture

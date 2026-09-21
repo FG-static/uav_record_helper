@@ -441,6 +441,9 @@ bool DatasetWriter::WriteSummary(const WriteResult& result,
     summary += "  accel_hold_ratio: " + fmt::FormatDouble(imu_stats.accel_hold_ratio) + "\n";
     summary += "  max_gap_ms: " + fmt::FormatDouble(imu_stats.max_gap_ms) + "\n";
     summary += "  grid_dt_ms: " + fmt::FormatDouble(imu_stats.grid_dt_ms) + "\n";
+    // 静止标定阶段实测的重力方向与 T_BS 第三列的夹角；这是「IMU 数据系 == 外参表所指系」的证据。
+    summary += "  static_gravity_vs_t_bs_col3_deg: " +
+               fmt::FormatDouble(provenance_.static_gravity_angle_deg) + "\n";
     summary += "  noise_source: " + provenance_.noise_source + "\n";
     summary += "  sigma_a: " + fmt::FormatDouble(noise_.sigma_a) + "\n";
     summary += "  sigma_bg: " + fmt::FormatDouble(noise_.sigma_bg) + "\n";

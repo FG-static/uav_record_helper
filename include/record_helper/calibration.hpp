@@ -54,4 +54,22 @@ struct GravityCheck {
 };
 GravityCheck CheckGravity(double mean_accel_norm, double expected_g, double tolerance);
 
+// 静止标定阶段设备是平放、镜头朝上的，所以世界上就是光学系 +z，静止段平均比力（重力反力，
+// 指向世界上）在 body 系里必须落在 T_BS 旋转的第三列上。
+//
+// 这条查的是「IMU 数据到底交在哪个系里」，与 CheckGravity 的模长检查正交：设备外参表、SDK
+// 取数路径、内核驱动三者中任何一个换了轴向口径，模长都照样好看，而这条会直接跳到 90°/180°。
+// 恒等外参本身不一定错——它取决于该路径交数据的系，因此只能实测，不能照抄文档。
+struct GravityDirectionCheck {
+    // 实测平均比力与 T_BS 第三列的夹角，度。measured_valid 为 false 时无意义。
+    double angle_deg{180.0};
+    Eigen::Vector3d measured{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d expected{Eigen::Vector3d::Zero()};
+    bool measured_valid{false};
+    bool pass{false};
+};
+GravityDirectionCheck CheckGravityDirection(const Eigen::Vector3d& mean_accel,
+                                            const Eigen::Matrix3d& camera_to_body_rotation,
+                                            double tolerance_deg);
+
 } // namespace rh::cal

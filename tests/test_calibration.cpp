@@ -120,3 +120,44 @@ RH_TEST(calibration_gravity_check) {
     CHECK(!rh::cal::CheckGravity(8.9, 9.81, 0.5).pass);
     CHECK_NEAR(rh::cal::CheckGravity(10.0, 9.81, 0.5).error, 0.19, 1e-9);
 }
+
+RH_TEST(calibration_gravity_direction_check) {
+    const Eigen::Matrix3d identity = Eigen::Matrix3d::Identity();
+    constexpr double kTol = 25.0;
+
+    // 平放镜头朝上 + 恒等外参：世界上 = 光学 +z = body +z。
+    const auto aligned =
+        rh::cal::CheckGravityDirection(Eigen::Vector3d(0.0, 0.0, 9.81), identity, kTol);
+    CHECK(aligned.measured_valid);
+    CHECK(aligned.pass);
+    CHECK_NEAR(aligned.angle_deg, 0.0, 1e-9);
+
+    // 模长完全正常、方向差 90°/180°：CheckGravity 拦不住，这条必须拦住。
+    CHECK(!rh::cal::CheckGravityDirection(Eigen::Vector3d(0.0, 9.81, 0.0), identity, kTol).pass);
+    CHECK(!rh::cal::CheckGravityDirection(Eigen::Vector3d(0.0, 0.0, -9.81), identity, kTol).pass);
+    CHECK_NEAR(
+        rh::cal::CheckGravityDirection(Eigen::Vector3d(0.0, 0.0, -9.81), identity, kTol).angle_deg,
+        180.0,
+        1e-6);
+
+    // 外参是约 90° 置换时，同一份数据就该换一种摆法才对：跟着第三列走即通过。
+    const Eigen::Matrix3d permuted =
+        Eigen::AngleAxisd(-90.0 * M_PI / 180.0, Eigen::Vector3d::UnitX()).toRotationMatrix();
+    const Eigen::Vector3d expected_body = permuted.col(2) * 9.81;
+    CHECK(rh::cal::CheckGravityDirection(expected_body, permuted, kTol).pass);
+
+    // 手摆歪 10° 不算错；容差内放行。
+    const Eigen::Vector3d tilted =
+        Eigen::AngleAxisd(10.0 * M_PI / 180.0, Eigen::Vector3d::UnitX()).toRotationMatrix() *
+        Eigen::Vector3d(0.0, 0.0, 9.81);
+    const auto tilted_check = rh::cal::CheckGravityDirection(tilted, identity, kTol);
+    CHECK_NEAR(tilted_check.angle_deg, 10.0, 1e-6);
+    CHECK(tilted_check.pass);
+
+    // 静止段没样本 / 数据退化时不下结论。
+    CHECK(!rh::cal::CheckGravityDirection(Eigen::Vector3d::Zero(), identity, kTol).measured_valid);
+    CHECK(!rh::cal::CheckGravityDirection(Eigen::Vector3d(0.0, 0.0, 0.5), identity, kTol)
+               .measured_valid);
+    CHECK(!rh::cal::CheckGravityDirection(Eigen::Vector3d(NAN, 0.0, 9.81), identity, kTol)
+               .measured_valid);
+}
