@@ -34,8 +34,10 @@ struct YamlBlock {
     int cols{0};
 };
 
-// 只接受两种形态：`key: [a, b, c]` 与 `key:` + 缩进的 cols/rows/data 块。
-// YAML block sequence（`- 1.0` 逐行）是刻意拒绝的——room_02 正是死在这里。
+// 接受三种形态：`key: [a, b, c]`、`key:` + 缩进的 cols/rows/data 块，以及 YAML block sequence
+// （`- 1.0` 逐行，元素可与 key 同缩进——PyYAML 默认就这么写）。最后这种是 2026-09-21 跟着上游
+// read_yaml_block 一起放开的：录制端仍然只写 flow 列表，放开只是为了让「verify 通过」继续等价于
+// 「上游能解析」，不把第三方导出包误判成不可用。
 [[nodiscard]] bool
 ReadYamlBlock(const std::string& path, const std::string& key, YamlBlock* out, std::string* error);
 [[nodiscard]] bool

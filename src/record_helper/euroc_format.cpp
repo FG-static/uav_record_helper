@@ -160,6 +160,19 @@ bool ParseNumberList(std::string_view text, std::vector<double>* values) {
     return true;
 }
 
+namespace {
+
+// YAML 的 block sequence 项标记是「- 」；负数写作 -0.5（连字符后无空格），两者不冲突。
+// 所以只接受 "- <值>"，值再走同一套严格数字边界。与上游 parse_sequence_item 对偶。
+[[nodiscard]] bool ParseSequenceItem(std::string_view field, double* value) {
+    if (field.size() < 3 || field.front() != '-' || (field[1] != ' ' && field[1] != '\t')) {
+        return false;
+    }
+    return ParseDouble(Trim(field.substr(1)), value);
+}
+
+} // namespace
+
 bool ReadYamlBlock(const std::string& path,
                    const std::string& key,
                    YamlBlock* out,
@@ -197,13 +210,37 @@ bool ReadYamlBlock(const std::string& path,
             return true;
         }
         bool have_data = false;
+        std::vector<double> sequence;
+        std::streampos next_position = lines.tellg();
         while (std::getline(lines, line)) {
             const std::string field = StripComment(line);
             if (field.empty()) {
+                next_position = lines.tellg();
                 continue;
             }
-            if (line.find_first_not_of(" \t") <= indent) {
+            const std::size_t field_indent = line.find_first_not_of(" \t");
+            double item = 0.0;
+            const bool is_item = ParseSequenceItem(field, &item);
+            // block sequence 的元素可以与 key 同缩进（YAML 合法，PyYAML 默认就这么写），
+            // 所以「是不是项标记」必须先于「是否已出块」判定。
+            if (!is_item && field_indent <= indent) {
+                lines.seekg(next_position); // 这行不属于当前 key，退回给外层，别吃掉它
                 break;
+            }
+            if (is_item) {
+                if (field_indent < indent) {
+                    lines.seekg(next_position);
+                    break;
+                }
+                if (have_data || block.cols != 0 || block.rows != 0) {
+                    return fail("cannot mix block sequence with matrix fields");
+                }
+                sequence.push_back(item);
+                next_position = lines.tellg();
+                continue;
+            }
+            if (!sequence.empty()) {
+                return fail("block sequence interrupted by " + field);
             }
             auto parse_shape = [&](const std::string& token, int* target, const char* field_name) {
                 std::int64_t parsed = 0;
@@ -225,20 +262,57 @@ bool ReadYamlBlock(const std::string& path,
                 if (have_data) {
                     return fail("duplicate data");
                 }
+                const std::size_t data_indent = field_indent;
                 std::string data_line(field.substr(5));
-                while (data_line.find(']') == std::string::npos && std::getline(lines, line)) {
-                    if (!StripComment(line).empty() && line.find_first_not_of(" \t") <= indent) {
-                        return fail("unterminated data list");
+                if (Trim(data_line).empty()) {
+                    // `data:` 换行写 block sequence。同缩进也算块内；遇到兄弟键
+                    // （PyYAML 按字母序把 rows:/cols: 排在 data: 之后）就退回给外层继续。
+                    std::streampos data_position = lines.tellg();
+                    while (std::getline(lines, line)) {
+                        const std::string item_field = StripComment(line);
+                        if (item_field.empty()) {
+                            data_position = lines.tellg();
+                            continue;
+                        }
+                        double data_item = 0.0;
+                        if (!ParseSequenceItem(item_field, &data_item) ||
+                            line.find_first_not_of(" \t") < data_indent) {
+                            lines.seekg(data_position);
+                            break;
+                        }
+                        block.data.push_back(data_item);
+                        data_position = lines.tellg();
                     }
-                    data_line += " " + StripComment(line);
-                }
-                if (!ParseNumberList(data_line, &block.data)) {
-                    return fail("malformed numeric data");
+                    if (block.data.empty()) {
+                        return fail("data block sequence is empty");
+                    }
+                } else {
+                    while (data_line.find(']') == std::string::npos && std::getline(lines, line)) {
+                        if (!StripComment(line).empty() &&
+                            line.find_first_not_of(" \t") <= indent) {
+                            return fail("unterminated data list");
+                        }
+                        data_line += " " + StripComment(line);
+                    }
+                    if (!ParseNumberList(data_line, &block.data)) {
+                        return fail("malformed numeric data");
+                    }
                 }
                 have_data = true;
+                next_position = lines.tellg();
             } else {
                 return fail("unknown matrix field");
             }
+        }
+        if (!sequence.empty()) {
+            // 顶层 block sequence 没有 cols/rows 语义：与行内 flow 列表同样按一行处理。
+            block.data = std::move(sequence);
+            block.cols = static_cast<int>(block.data.size());
+            block.rows = 1;
+            if (out != nullptr) {
+                *out = block;
+            }
+            return true;
         }
         if (!have_data || block.cols <= 0 || block.rows <= 0 ||
             static_cast<std::uint64_t>(block.cols) * static_cast<std::uint64_t>(block.rows) !=

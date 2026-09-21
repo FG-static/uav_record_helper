@@ -99,9 +99,10 @@ RH_TEST(euroc_format_yaml_flow_and_matrix) {
     CHECK(!rh::fmt::ReadYamlScalar(path, "missing_key", &scalar, &error));
 }
 
-RH_TEST(euroc_format_rejects_block_sequence) {
-    // room_02 的 sensor.yaml 就是这个写法；上游解析器在第一个键上就失败，我们也必须失败。
-    const rh::testing::TempDirectory temp("rh-yaml-bad");
+RH_TEST(euroc_format_reads_block_sequence) {
+    // 上游 read_yaml_block 已接受 block sequence（含 PyYAML 默认的「与 key 同缩进」写法）。
+    // 对偶实现必须跟上，否则「rh verify 通过 ⟺ 上游能解析」这个前提就断了。
+    const rh::testing::TempDirectory temp("rh-yaml-blockseq");
     const std::string path = rh::fmt::JoinPath(temp.path(), "sensor.yaml");
     std::string error;
     const std::string yaml = "sensor_type: camera\n"
@@ -113,12 +114,42 @@ RH_TEST(euroc_format_rejects_block_sequence) {
                              "  cols: 4\n"
                              "  data:\n"
                              "  - 1.0\n"
-                             "  - 0.0\n";
+                             "  - 0.0\n"
+                             "  - 0.0\n"
+                             "  - 0.0\n"
+                             "  - 0.0\n"
+                             "  - 1.0\n"
+                             "  - 0.0\n"
+                             "  - 0.0\n"
+                             "  - 0.0\n"
+                             "  - 0.0\n"
+                             "  - 1.0\n"
+                             "  - 0.0\n"
+                             "  - 0.0\n"
+                             "  - 0.0\n"
+                             "  - 0.0\n"
+                             "  - 1.0\n"
+                             "rate_hz: 30\n";
     CHECK(rh::fmt::WriteWholeFile(path, yaml, &error));
     rh::fmt::YamlBlock block;
-    CHECK(!rh::fmt::ReadYamlBlock(path, "resolution", &block, &error));
-    CHECK(!error.empty());
+    CHECK(rh::fmt::ReadYamlBlock(path, "resolution", &block, &error));
+    CHECK(block.data.size() == 2 && block.cols == 2 && block.rows == 1 && block.data[0] == 640.0 &&
+          block.data[1] == 480.0);
     error.clear();
+    CHECK(rh::fmt::ReadYamlBlock(path, "T_BS", &block, &error));
+    CHECK(block.data.size() == 16 && block.cols == 4 && block.rows == 4);
+    // 块之后的顶层键不能被吃掉。
+    double rate = 0.0;
+    CHECK(rh::fmt::ReadYamlScalar(path, "rate_hz", &rate, &error));
+    CHECK(rate == 30.0);
+
+    // 仍然要拒的：元素数与 rows/cols 不符（理由必须是数量不匹配，不是语法不认识）、
+    // 以及无空格负数混进块里（那不是合法项标记）。
+    CHECK(rh::fmt::WriteWholeFile(path, "T_BS:\n  cols: 4\n  rows: 4\n  data:\n  - 1.0\n  - 2.0\n",
+                                  &error));
+    CHECK(!rh::fmt::ReadYamlBlock(path, "T_BS", &block, &error));
+    CHECK(rh::fmt::WriteWholeFile(
+        path, "T_BS:\n  cols: 1\n  rows: 2\n  data:\n  - 1.0\n-0.5\n", &error));
     CHECK(!rh::fmt::ReadYamlBlock(path, "T_BS", &block, &error));
 }
 

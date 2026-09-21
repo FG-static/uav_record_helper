@@ -8,7 +8,7 @@
 
 | 判定 | 位置 | 对录制的约束 |
 | --- | --- | --- |
-| YAML 只能按 flow 列表解析 | `tests/integration/euroc_dataset.cpp` 的 `read_yaml_block`（`key: [a, b]` 或 `cols/rows/data:`） | `sensor.yaml` 绝不能写 `- 640` 这种 block sequence |
+| YAML 按最小子集解析：flow 列表、`cols/rows/data:` 块，以及（2026-09-21 起）block sequence | `tests/integration/euroc_dataset.cpp` 的 `read_yaml_block` | 录制端仍然只写 flow 列表：最省事、跨解析器最不容易出事；放开的意义只是让 `rh verify` 不把第三方导出的 block-sequence 包误判成不可用 |
 | 数字必须被 `from_chars` 完整消费，拒绝 NaN/Inf | 同文件 `parse_number` / `parse_number_list` | 数值用最短可往返的十进制写法，时间戳用纯整数纳秒 |
 | IMU CSV 恰好 7 列、时间戳非负且严格递增 | `euroc_dataset.cpp:413-431`、`parse_csv_time` | `ts,wx,wy,wz,ax,ay,az`；任何一行坏 → 整文件失败 |
 | 相机 CSV 恰好 2 列 | `euroc_dataset.cpp:451-466` | `ts,filename`，文件名原样拼接进 `cam<N>/data/` |

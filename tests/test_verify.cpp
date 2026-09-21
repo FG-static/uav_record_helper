@@ -158,14 +158,20 @@ RH_TEST(verify_accepts_generated_dataset) {
     CHECK(report.accel_hold_ratio < 0.05);
 }
 
-RH_TEST(verify_rejects_block_sequence_yaml) {
+RH_TEST(verify_accepts_block_sequence_yaml) {
+    // 上游 read_yaml_block 放开了 block sequence，verify 必须跟着放开：这样的包要能判定为可用，
+    // 否则「verify 通过 ⟺ 上游能解析」就变成「verify 比上游更严」，会把第三方导出包误杀。
     const std::string root = Fixture().Copy("block-seq");
     CHECK(!root.empty());
     const std::string path = rh::fmt::JoinPath(root, "mav0/cam0/sensor.yaml");
     CHECK(ReplaceInFile(path, "resolution: [160, 120]", "resolution:\n- 160\n- 120"));
     const auto report = rh::VerifyDataset(root, FixtureOptions());
-    CHECK(HasFailing(report, "camera.sensor_yaml"));
-    CHECK(!report.ok());
+    if (!report.ok()) {
+        std::printf("    block sequence 包意外失败 %s\n", FirstFailure(report).c_str());
+    }
+    CHECK(HasCheck(report, "camera.sensor_yaml", rh::CheckStatus::Pass));
+    CHECK(report.calibration_parsed);
+    CHECK(report.ok());
 }
 
 RH_TEST(verify_rejects_missing_imu_noise) {

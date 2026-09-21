@@ -18,7 +18,7 @@ rh verify D # 按 unav_vio 的解析规则审查任意 mav0 数据集（含既�
 
 | 症状 | 根因 |
 | --- | --- |
-| `sensor.yaml` 根本解析不进来 | 导出器写的是 YAML block sequence（`- 640`），而 `euroc_dataset.cpp` 的最小 YAML 解析器只认 flow 列表 |
+| `sensor.yaml` 根本解析不进来 | 导出器写的是 YAML block sequence（`- 640`），而当时 `euroc_dataset.cpp` 的最小 YAML 解析器只认 flow 列表（该子集已于 2026-09-21 放开，见 `docs/format-contract.md`） |
 | 标定被拒 | `imu0/sensor.yaml` 没有四个噪声键，而 `validate_calibration` 要求它们严格 > 0 |
 | 左右对不上 | 左右 image sequence 独立丢帧，`synchronize_stereo_stamps` 要求 ns 全等，`dropped_count=41` |
 | IMU 是假数据 | ROS `unite_imu_method` 把 250 Hz 加表零阶保持到 400 Hz 陀螺栅格，38.3 % 的行在重复上一个加表值 |

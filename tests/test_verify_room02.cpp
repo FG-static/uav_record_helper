@@ -40,12 +40,16 @@ RH_TEST(verify_reports_room02_blockers) {
         }
     }
     CHECK(!report.ok());
-    CHECK(HasFailing(report, "camera.sensor_yaml"));           // block sequence
+    // 数据层面的失败与 YAML 形态无关，仍然逐条钉住：
     CHECK(HasFailing(report, "imu.noise_density"));            // 四个噪声键缺失
     CHECK(HasFailing(report, "stereo.hard_sync"));             // 左右时间戳集合不全等
-    CHECK(!report.calibration_parsed);                         // block sequence 让外参根本读不进来
     CHECK(HasFailing(report, "initialization.static_window")); // 开头没有静止段
     CHECK(HasFailing(report, "ground_truth"));                 // 没有 state_groundtruth_estimate0
     CHECK(report.dropped_pairs > 0);
     CHECK(report.accel_hold_ratio > 0.1); // ROS unite_imu_method 的零阶保持痕迹
+    // camera.sensor_yaml 与 calibration_parsed 这两条原先也钉在这里：room_02 的 sensor.yaml 写的是
+    // block sequence，旧解析器在第一个键就失败。2026-09-21 上游 read_yaml_block 放开了 block
+    // sequence，那份文件现在应当能读进来，所以这里不再断言它失败——但也不反过来说它一定通过：
+    // room_02 的其余字段是否合法没人核过。要重新钉住，需在持有 room_02 的机器上跑一次本用例，
+    // 按打印出来的检查结论重新立基线。
 }
