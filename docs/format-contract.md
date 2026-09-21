@@ -92,12 +92,17 @@
 | `imu_noise.g` | `euroc_dataset.cpp:387` 硬编码 9.81 | 录制端只能要求静止段 `‖a‖` 与 9.81 相符（`verify` 的 `initialization.gravity`，容差 0.5 m/s² 取自 `InitializerConfig::max_static_accel_norm_error_mps2`） |
 | `calibration.version` | `vio_mh01_replay_test.cpp:493` 传入常量 1 | 无影响，录制端不写这个字段 |
 
-## 「仅回放、不评估」需要动的一行
+## 「仅回放、不评估」的那道开关
 
-`--no-pose-gt` 录出来的数据集刻意没有 `state_groundtruth_estimate0/`。
-当前 `tests/integration/vio_mh01_replay_test.cpp:502` 的
-`test.expect(gt.ok, "GT 读取失败")` 会在加载阶段就早退，因此想只跑估计链不出指标，
-需要在上游把这条断言改成「GT 缺失则跳过 `evaluate_trajectory`」。
-RecordHelper 不替你改 `unav_vio`：那是别人的验收判据，改了就等于换了一个测试。
-`rh verify --no-gt-required` 会在自己的报告里把该项降为 WARN，其余检查照常，
-这样你能先确认「除了 GT 之外全部满足契约」。
+`--no-pose-gt` 录出来的数据集刻意没有 `state_groundtruth_estimate0/`。上游
+`tests/integration/vio_mh01_replay_test.cpp` 原先在 `expect(gt.ok)` 失败后立刻 `return`，
+连静止→运动边界都测不到。现在（2026-09-21，经用户同意后改的是 `unav_vio` 一侧）该判据可由
+`UNAV_VIO_MH01_REQUIRE_GT=0` 显式降级：只放弃「轨迹指标可用 + ATE/RPE 健康界」这一层，
+解析、标定、硬同步、初始化及时性、状态发布完整性、求解器统计照常要求。
+
+- **默认值不变**：不设该变量时仍然必须有 GT，MH_01_easy 的回归判据一字未改。
+- 只有精确字符串 `0` 才降级，变量名或值写错都不会悄悄放宽。
+- 结论行会印 `require_gt=0/1`，所以「降级跑过」在事后能被区分出来。
+
+RecordHelper 自己不碰 `unav_vio` 的判据；`rh verify --no-gt-required` 只在自己的报告里把该项
+降为 WARN，用来先确认「除了 GT 之外全部满足契约」。

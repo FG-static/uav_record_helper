@@ -5,5 +5,6 @@ build-*/
 compile_commands.json
 .DS_Store
 datasets/
+d435i_*/
 *.record/
 *.log

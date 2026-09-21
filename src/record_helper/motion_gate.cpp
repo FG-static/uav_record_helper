@@ -306,6 +306,27 @@ NoiseEstimate EstimateImuNoise(const std::vector<GyroSample>& gyro,
     if (gyro_ok && accel_ok) {
         estimate.noise.measured = true;
         estimate.note = "measured=allan_two_lag";
+        // 几秒的静止段上，块均值方差常常还小于白噪声项，残差为负 → 随机游走被估成 0。
+        // 而上游 validate_calibration 要求四个键严格 > 0，写 0 出去就是「格式能过但权重是假的」。
+        // 所以逐项退回保守默认，并把被兜底的键名写进 note，绝不冒充实测值。
+        std::string floored;
+        const auto floor_key = [&](const char* name, double* value, double fallback) {
+            if (std::isfinite(*value) && *value > 0.0) {
+                return;
+            }
+            *value = fallback;
+            if (!floored.empty()) {
+                floored += "+";
+            }
+            floored += name;
+        };
+        floor_key("sigma_g", &estimate.noise.sigma_g, 4.0e-4);
+        floor_key("sigma_bg", &estimate.noise.sigma_bg, 4.0e-6);
+        floor_key("sigma_a", &estimate.noise.sigma_a, 1.0e-3);
+        floor_key("sigma_ba", &estimate.noise.sigma_ba, 5.0e-5);
+        if (!floored.empty()) {
+            estimate.note += "+floor=" + floored;
+        }
     } else {
         estimate.note = "fallback=insufficient_static_samples";
     }

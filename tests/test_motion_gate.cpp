@@ -174,11 +174,41 @@ RH_TEST(motion_gate_noise_estimate_recovers_white_density) {
     CHECK(estimate.noise.sigma_a > expected_accel * 0.85);
     CHECK(estimate.noise.sigma_a < expected_accel * 1.15);
     CHECK(estimate.noise.sigma_bg >= 0.0); // 纯白噪声下随机游走被钳到 0，不伪造负方差
+    CHECK(estimate.noise.sigma_ba > 0.0);  // 上游 validate_calibration 要求四个键严格 > 0
 
     const auto short_window =
         rh::EstimateImuNoise(gyro, accel, 0, static_cast<TimeNs>(400'000'000));
     CHECK(!short_window.noise.measured);
     CHECK(short_window.noise.sigma_g > 0.0); // 回退值仍然可用，上游要求 > 0
+}
+
+RH_TEST(motion_gate_noise_estimate_floors_nonpositive_random_walk) {
+    // 高频抖动很大、块均值却一动不动的信号（逐样本方波）：随机游走的残差方差必然为负，
+    // 估不出正值。这时逐项退回保守默认并在 note 里点名，绝不写 0 出去冒充实测值。
+    std::vector<rh::GyroSample> gyro;
+    std::vector<rh::AccelSample> accel;
+    for (std::size_t index = 0; index < 400 * 6; ++index) {
+        const TimeNs stamp = static_cast<TimeNs>(index * 2'500'000LL);
+        const double sign = (index % 2 == 0) ? 1.0 : -1.0;
+        rh::GyroSample gyro_sample;
+        gyro_sample.t_ns = stamp;
+        gyro_sample.w = Eigen::Vector3d(sign * 2.0e-3, sign * 2.0e-3, sign * 2.0e-3);
+        gyro.push_back(gyro_sample);
+        rh::AccelSample accel_sample;
+        accel_sample.t_ns = stamp;
+        accel_sample.a =
+            Eigen::Vector3d(sign * 4.0e-3, sign * 4.0e-3, 9.81 + sign * 4.0e-3);
+        accel.push_back(accel_sample);
+    }
+    const auto estimate = rh::EstimateImuNoise(gyro, accel, 0, gyro.back().t_ns);
+    CHECK(estimate.noise.measured);
+    CHECK(estimate.noise.sigma_g > 0.0); // 白噪声密度照常实测
+    CHECK(estimate.noise.sigma_a > 0.0);
+    CHECK(estimate.note.find("floor=") != std::string::npos);
+    CHECK(estimate.note.find("sigma_bg") != std::string::npos);
+    CHECK(estimate.note.find("sigma_ba") != std::string::npos);
+    CHECK(estimate.noise.sigma_bg > 0.0);
+    CHECK(estimate.noise.sigma_ba > 0.0);
 }
 
 RH_TEST(motion_gate_noise_estimate_sees_bias_random_walk) {

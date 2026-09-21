@@ -278,11 +278,15 @@ bool ParseImuCsv(const std::string& path,
 
 bool ParseCameraCsv(const std::string& path,
                     std::vector<CameraRow>* rows_out,
-                    VerificationReport* report) {
+                    VerificationReport* report,
+                    bool required = true) {
     std::string content;
     std::string error;
     if (!fmt::ReadWholeFile(path, &content, &error)) {
-        report->Add(CheckStatus::Fail, "camera.data_csv", error);
+        // 可选流（depth0）缺失不是契约违规：--no-depth 录出来的包本来就没有。
+        if (required) {
+            report->Add(CheckStatus::Fail, "camera.data_csv", error);
+        }
         return false;
     }
     const auto csv = fmt::SplitCsvRows(content);
@@ -476,14 +480,18 @@ VerificationReport VerifyDataset(const std::string& dataset_root, const VerifyOp
                     fmt::FormatDouble(geometry.off_axis_baseline_ratio) + "；" +
                     geometry.interpretation);
         }
-        // 恒等旋转是「能过校验但结果是错的」典型症状：D435i 的光学系相对 IMU 系必然差约 90°。
+        // 单位阵「数值上合法但可能整体错」，值得提醒；但它是哪一边错，数据集本身说不清：
+        // 取决于该路径把加表数据交在哪个系里。本机 SDK 直读实测过，记录系与外参表同口径、
+        // 单位阵成立（见 record_summary.yaml 的 static_gravity_vs_t_bs_col3_deg）。
+        // 所以这里只提示，不判死——判死会把好数据也拒掉。
         const bool identity_like =
             to_body0.r(0, 0) > 0.999 && to_body0.r(1, 1) > 0.999 && to_body0.r(2, 2) > 0.999;
         if (identity_like) {
-            report.Add(CheckStatus::Fail,
+            report.Add(CheckStatus::Warn,
                        "calibration.identity_extrinsic",
-                       "T_BS 旋转是单位阵：D435i 的相机光学系与 IMU 系之间应约为 "
-                       "[-90°,0,-90°] 的轴向置换，恒等外参会让重力方向和图像投影同时错");
+                       "T_BS 旋转是单位阵：只有当 imu0 的数据系与外参表同口径时才成立。"
+                       "录制端用静止段实测核对（rh record 打印夹角并写进 record_summary.yaml）；"
+                       "外来数据集无法据此判定时，以回放初始化结果为准");
         }
     }
 
@@ -569,7 +577,7 @@ VerificationReport VerifyDataset(const std::string& dataset_root, const VerifyOp
     }
 
     std::vector<CameraRow> depth_frames;
-    if (ParseCameraCsv(fmt::JoinPath(mav0, "depth0/data.csv"), &depth_frames, &report)) {
+    if (ParseCameraCsv(fmt::JoinPath(mav0, "depth0/data.csv"), &depth_frames, &report, false)) {
         report.depth_rows = depth_frames.size();
         report.Add(CheckStatus::Pass,
                    "depth",

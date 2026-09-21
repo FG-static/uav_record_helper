@@ -199,8 +199,9 @@ RH_TEST(verify_rejects_unpaired_camera_timestamps) {
     CHECK(report.dropped_pairs > 0);
 }
 
-RH_TEST(verify_rejects_identity_extrinsics) {
-    // room_02 的情况：T_BS 是单位阵，数值上仍是合法旋转，但重力方向与投影全错。
+RH_TEST(verify_warns_on_identity_extrinsics) {
+    // 单位阵「数值上合法但口径可疑」，值得提醒；但数据集自己说不清哪边错：本机 SDK 直读实测过，
+    // 记录系与外参表同口径时单位阵就是对的。所以它只能是 WARN，不能把好数据判死。
     const std::string root = Fixture().Copy("identity-tbs");
     const std::string path = rh::fmt::JoinPath(root, "mav0/cam0/sensor.yaml");
     std::string content;
@@ -215,7 +216,8 @@ RH_TEST(verify_rejects_identity_extrinsics) {
     content = content.substr(0, begin) + identity + content.substr(line_end + 1);
     CHECK(rh::fmt::WriteWholeFile(path, content, &error));
     const auto report = rh::VerifyDataset(root, FixtureOptions());
-    CHECK(HasFailing(report, "calibration.identity_extrinsic"));
+    CHECK(HasCheck(report, "calibration.identity_extrinsic", rh::CheckStatus::Warn));
+    CHECK(!HasFailing(report, "calibration.identity_extrinsic"));
 }
 
 RH_TEST(verify_rejects_broken_imu) {

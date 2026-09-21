@@ -124,6 +124,17 @@ env UNAV_VIO_EUROC_MH01=~/datasets/room_03 \
 
 数据集根目录直接就是 `UNAV_VIO_EUROC_MH01` 该指的地方，不需要任何中转脚本。
 
+设备没有位姿流（`--no-pose-gt`，或本机这种根本不枚举 `RS2_STREAM_POSE` 的构建）时，包里就没有
+`state_groundtruth_estimate0/`。加 `UNAV_VIO_MH01_REQUIRE_GT=0` 可以让上游回放测试只放弃「轨迹精度」
+那一层判据（ATE/RPE），其余——解析、标定、双目硬同步、初始化及时性、状态发布完整性、求解器统计——
+照常要求；默认不设该变量时仍然必须有 GT，结论行会印 `require_gt=0/1` 以便事后区分：
+
+```bash
+env UNAV_VIO_EUROC_MH01=~/datasets/room_03 UNAV_VIO_MH01_MAX_FRAMES=300 \
+    UNAV_VIO_MH01_REQUIRE_GT=0 \
+    ctest --test-dir <unav_vio build> -R mh01_replay --output-on-failure
+```
+
 ## 产物结构
 
 ```
