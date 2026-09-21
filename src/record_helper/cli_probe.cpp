@@ -30,7 +30,8 @@ const char* DistortionHint(const cal::StereoGeometrySummary& geometry) {
 int RunProbe(int argc, char** argv) {
     ArgumentParser parser(argc, argv, "probe");
     std::string error;
-    if (!parser.Parse()) {
+    // serial 可能是字母，pose-gt / projector 是关键字取值，必须声明成带字符串取值的选项。
+    if (!parser.Parse({"serial", "pose-gt", "projector"})) {
         std::printf("%s\n", error.c_str());
         return 2;
     }

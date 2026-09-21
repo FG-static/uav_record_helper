@@ -20,7 +20,9 @@ class ArgumentParser {
   public:
     ArgumentParser(int argc, char** argv, std::string usage);
 
-    bool Parse();
+    // string_valued 里的选项，后面紧跟的 token 一律当取值吃掉（--imu-grid accel、--seq room_03）。
+    // 没声明的选项仍只接受数字取值，这样布尔开关不会把后面的位置参数吞掉。
+    bool Parse(const std::vector<std::string>& string_valued = {});
     // 每个子命令显式声明自己的合法选项，拼错的选项必须立刻失败而不是被忽略。
     bool RejectUnknown(const std::vector<std::string>& known, std::string* error) const;
     bool Has(const std::string& name) const;

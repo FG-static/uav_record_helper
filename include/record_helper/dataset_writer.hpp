@@ -19,6 +19,8 @@ namespace rh {
 struct WriteOptions {
     bool write_depth{true};
     bool write_pose_gt{true};
+    // IMU 两条流统一到谁的原始时间戳上，见 ImuGridMode。默认保持陀螺栅格 + 加表内插。
+    ImuGridMode imu_grid{ImuGridMode::kGyroTimestamps};
     // D400 交付的红外图已被硬件修正过，但固件仍会报告一整套畸变系数。默认原样写出报告值，
     // rh probe 的两目几何摘要用于确认是否该改用 --zero-distortion。
     bool zero_distortion{false};
@@ -48,7 +50,6 @@ struct Provenance {
     // 静止标定阶段实测：平均比力与 T_BS 第三列的夹角（度）。<0 = 没测成。见 CheckGravityDirection。
     double static_gravity_angle_deg{-1.0};
     int camera_fps{30};
-    int imu_gyro_hz{400};
 };
 
 // 一对已落盘双目图像的共享曝光时间戳。右目原始时间戳只用于统计偏斜。
@@ -123,7 +124,8 @@ class DatasetWriter {
 
   private:
     void WriterLoop();
-    bool WriteCalibrationFiles(std::string* error);
+    // imu_stats 只用来把 imu0/sensor.yaml 的 rate_hz 写成 data.csv 的实际行速率。
+    bool WriteCalibrationFiles(const ImuAlignStats& imu_stats, std::string* error);
     bool WriteImuCsv(const std::vector<ImuRow>& rows, std::string* error);
     bool WriteCameraCsv(const std::vector<WrittenFrame>& frames, std::string* error);
     bool WriteDepthCsv(const std::vector<TimeNs>& times, std::string* error);

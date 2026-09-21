@@ -109,11 +109,15 @@ struct ImuAlignStats {
     std::size_t accel_raw{0};
     std::size_t rows{0};
     std::size_t dropped_non_increasing{0};
-    std::size_t accel_interpolated{0};
     double grid_dt_ms{0.0};
     double max_gap_ms{0.0};
-    // 相邻两行加表完全相同的比例。room_02 的这个值是 0.38，即零阶保持伪造出来的常量段。
+    // 相邻两行加表/陀螺完全相同的比例。room_02 的 accel_hold_ratio 是 0.38，
+    // 那就是零阶保持伪造出来的常量段；陀螺抽稀模式下要盯的是 gyro_hold_ratio。
     double accel_hold_ratio{0.0};
+    double gyro_hold_ratio{0.0};
+    // 抽稀模式：栅格时刻与所取陀螺实测样本的时刻之间最大的偏移（ms）。
+    // 内插模式恒为 0，因为内插值就定义在栅格时刻上。
+    double max_source_skew_ms{0.0};
 };
 
 struct CaptureStats {

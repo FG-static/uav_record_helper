@@ -1,5 +1,6 @@
 #include "cli_common.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,16 @@ namespace {
 
 bool ValueToken(const std::string& token) {
     return !token.empty() && token[0] != '-';
+}
+
+bool IsNumeric(const std::string& token) {
+    for (const char character : token) {
+        if (std::isdigit(static_cast<unsigned char>(character)) == 0 && character != '.' &&
+            character != '-') {
+            return false;
+        }
+    }
+    return true;
 }
 
 void OnInterrupt(int) {
@@ -29,7 +40,7 @@ ArgumentParser::ArgumentParser(int argc, char** argv, std::string usage)
     }
 }
 
-bool ArgumentParser::Parse() {
+bool ArgumentParser::Parse(const std::vector<std::string>& string_valued) {
     for (std::size_t index = 0; index < args_.size(); ++index) {
         const std::string& token = args_[index];
         if (token.size() > 2 && token[0] == '-' && token[1] == '-') {
@@ -40,15 +51,12 @@ bool ArgumentParser::Parse() {
                 value = name.substr(equals + 1);
                 name = name.substr(0, equals);
             } else if (index + 1 < args_.size() && ValueToken(args_[index + 1])) {
-                bool numeric = true;
-                for (const char character : args_[index + 1]) {
-                    if (std::isdigit(static_cast<unsigned char>(character)) == 0 &&
-                        character != '.' && character != '-') {
-                        numeric = false;
-                        break;
-                    }
-                }
-                if (numeric) {
+                // 只认数字取值是不够的：--seq room_04 / --imu-grid accel / --pose-gt off
+                // 会被退回默认值，而那个词变成游离的位置参数，选项等于被静默忽略。
+                const bool wants_value =
+                    std::find(string_valued.begin(), string_valued.end(), name) !=
+                    string_valued.end();
+                if (wants_value || IsNumeric(args_[index + 1])) {
                     value = args_[++index];
                 }
             }

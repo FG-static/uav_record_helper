@@ -137,6 +137,56 @@ RH_TEST(dataset_writer_produces_replayable_tree) {
     CHECK(report.available_frames > 100);
 }
 
+RH_TEST(dataset_writer_accel_grid_writes_decimated_imu) {
+    const rh::testing::TempDirectory temp("rh-imu-grid");
+    CHECK(temp.valid());
+    const std::string gyro_root = rh::fmt::JoinPath(temp.path(), "gyro_grid");
+    const std::string accel_root = rh::fmt::JoinPath(temp.path(), "accel_grid");
+    rh::WriteOptions accel_options = rh::testing::SyntheticOptions();
+    accel_options.imu_grid = rh::ImuGridMode::kAccelTimestamps;
+    const WriteResult gyro = WriteSyntheticDataset(gyro_root);
+    const WriteResult decimated = WriteSyntheticDataset(accel_root, accel_options);
+    CHECK(gyro.imu_rows > 1000);
+    CHECK(decimated.pairs == gyro.pairs); // 换栅格不该影响双目那一侧
+    // 同一份输入只换栅格：行数按 250/400 缩，留一点裁窗余量。
+    const double row_ratio =
+        static_cast<double>(decimated.imu_rows) / static_cast<double>(gyro.imu_rows);
+    CHECK(row_ratio > 0.5);
+    CHECK(row_ratio < 0.75);
+
+    const std::string accel_mav0 = rh::fmt::JoinPath(accel_root, "mav0");
+    const std::string imu_csv = ReadFile(rh::fmt::JoinPath(accel_mav0, "imu0/data.csv"));
+    const auto rows = rh::fmt::SplitCsvRows(imu_csv);
+    CHECK(rows.size() == decimated.imu_rows);
+    std::int64_t first = 0;
+    std::int64_t last = 0;
+    CHECK(rh::fmt::ParseInt64(rows.front()[0], &first));
+    CHECK(rh::fmt::ParseInt64(rows.back()[0], &last));
+    const double mean_dt_ms = static_cast<double>(last - first) * 1e-6 /
+                              static_cast<double>(rows.size() - 1);
+    CHECK_NEAR(mean_dt_ms, 4.0, 0.05); // 加表的原始节拍，不是陀螺的 2.5 ms
+
+    // rate_hz 描述的是 data.csv 的行速率，抽稀模式下必须跟着变成 250 而不是设备的 400。
+    CHECK(ReadFile(rh::fmt::JoinPath(accel_mav0, "imu0/sensor.yaml")).find("rate_hz: 250") !=
+          std::string::npos);
+    const std::string summary = ReadFile(rh::fmt::JoinPath(accel_root, "record_summary.yaml"));
+    CHECK(summary.find("grid: accel timestamps") != std::string::npos);
+    CHECK(summary.find("resample: gyro_nearest_measured_sample") != std::string::npos);
+    CHECK(summary.find("max_source_skew_ms") != std::string::npos);
+    CHECK(ReadFile(rh::fmt::JoinPath(gyro_root, "record_summary.yaml"))
+              .find("resample: accel_linear_interpolation") != std::string::npos);
+
+    rh::VerifyOptions verify_options;
+    verify_options.min_imu_rows = 0;
+    const auto report = rh::VerifyDataset(accel_root, verify_options);
+    if (!report.ok()) {
+        rh::PrintReport(report, stdout);
+    }
+    CHECK(report.ok());
+    CHECK(report.accel_hold_ratio < 0.01); // 加表列逐字来自实测样本
+    CHECK(report.gyro_hold_ratio < 0.05);  // 陀螺抽稀不该退化成零阶保持
+}
+
 RH_TEST(dataset_writer_trims_uncovered_tail) {
     // 加表比陀螺早停 1 s：尾部若干双目帧没有 IMU 右端覆盖，必须由写盘阶段裁掉而不是补值。
     const rh::testing::TempDirectory temp("rh-trim");

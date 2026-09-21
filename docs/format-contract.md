@@ -32,9 +32,16 @@
 1. **格式编解码是上游解析器的对偶实现。** `src/record_helper/euroc_format.cpp` 逐条复刻
    `strip comment → trim → from_chars 必须整段消费 → flow 列表 → cols/rows/data 块`，
    所以 `rh verify` 通过 = 上游能解析，不需要靠肉眼比对 YAML。
-2. **IMU 统一到陀螺原始时间戳栅格。** 加表（250 Hz）线性内插到陀螺（400 Hz）时刻；
-   端点之外一律丢弃，不做零阶保持；先排序再去重时间戳，保证严格递增。
-   `record_summary.yaml` 里的 `accel_hold_ratio` 就是这项健康度指标（room_02 = 0.383）。
+2. **IMU 统一到一条原始时间戳栅格（`--imu-grid`）。** `data.csv` 一行只有一个时刻，而加表与陀螺
+   各有各的节拍，必须挑一条流当栅格，两种模式都**绝不零阶保持**、覆盖不到就整行丢弃：
+   - `gyro`（默认）：陀螺 400 Hz 时刻当栅格，加表（250 Hz）线性内插到这些时刻。陀螺保持全速率，
+     但加表列是算出来的；攒够回放测试的 30000 行约需 75 s。
+   - `accel`：加表 250 Hz 时刻当栅格，陀螺只保留时间最近的实测样本（抽稀）。两列都是设备实测值，
+     一个数都不造；代价是陀螺降到加表速率（30000 行约需 120 s），且每行的 `w` 可能来自栅格时刻
+     ±1.25 ms 处的样本，实际最大偏移写进 `record_summary.yaml` 的 `max_source_skew_ms`。
+   先排序再去重时间戳，保证严格递增。`record_summary.yaml` 会写明本次用的是哪条栅格、
+   重采样方式（`accel_linear_interpolation` / `gyro_nearest_measured_sample`），以及
+   `accel_hold_ratio` / `gyro_hold_ratio` 两项健康度指标（room_02 的 `accel_hold_ratio` = 0.383）。
 3. **只裁窗，不造数。** `SelectReplayWindow` 在每个连续 IMU 段内挑最长的、
    同时满足「IMU 前置 ≥55 ms」「最后一个曝光右端 + `--tail` 有覆盖」
    「帧间隔 ≤150 ms」且「内部存在静止→运动边界」的双目区间。窗口从 IMU 覆盖到的第一帧起，

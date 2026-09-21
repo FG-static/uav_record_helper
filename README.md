@@ -27,7 +27,8 @@ rh verify D # 按 unav_vio 的解析规则审查任意 mav0 数据集（含既�
 | 无指标 | 没有 `state_groundtruth_estimate0`，`integration.mh01_replay` 会在加载 GT 时早退 |
 
 RecordHelper 在录制端逐条堵住这些坑：**只写 flow 列表**、**噪声从本次静止段实测**、
-**一对双目共享同一个时间戳**、**加表线性内插且绝不零阶保持**、**引导你完成静止 + 温和激励**、
+**一对双目共享同一个时间戳**、**IMU 统一到一条原始时间戳栅格且绝不零阶保持（`--imu-grid`）**、
+**引导你完成静止 + 温和激励**、
 **外参取设备标定并做正交化、再用静止段实测重力方向核对它与数据是否同一个系**、
 **可选录设备端位姿流当伪 GT**。
 
@@ -81,6 +82,7 @@ open -a Terminal /Users/mac/src/record_helper
 ./build-release/rh probe
 ./build-release/rh record --out ~/datasets --seq room_03 --exposure-us 3000
 ./build-release/rh record --seq room_04 --still 5 --excite 4 --exposure-us 4000 --no-pose-gt
+./build-release/rh record --seq room_05 --imu-grid accel   # 两列都要实测值，陀螺抽稀到 250 Hz
 ```
 
 | 阶段 | 谁推进 | 你做什么 |
@@ -94,9 +96,27 @@ open -a Terminal /Users/mac/src/record_helper
 结束正式录制：`Enter` 或 `q` 或 Ctrl-C，然后自动收尾写盘并 `verify`。`x` 放弃。静止标定不能跳。
 标定或激励阶段按 `q` / Ctrl-C 会放弃，不会跳过静止直接出盘。
 
-`--duration` 只是状态行上的建议时长（IMU 要过 30000 行大约 80 s），**到点不会自动停**。
+`--duration` 只是状态行上的建议时长（IMU 要过 30000 行，`--imu-grid gyro` 约 75 s、
+`accel` 约 120 s），**到点不会自动停**。
 
 回放侧 `unav_vio` 仍取序列里**最后一个**静止→运动边界做初始化。本工具不再因为中途停下而改录制状态或删帧；若你希望回放从开头那次标定起步，正式录制里就不要再出现一段够长的静止后又起步。
+
+### `--imu-grid gyro|accel`：IMU 栅格选哪条流
+
+`imu0/data.csv` 一行只有一个时刻，而 D435i 的加表（250 Hz）和陀螺（400 Hz）各有各的节拍，
+所以必须挑一条流的时间戳当栅格、把另一条流配上去。room_02 就是在这一步被 ROS 驱动的
+`unite_imu_method=copy` 用零阶保持糊过去的（38 % 的行在重复上一个加值）。
+RecordHelper 两种模式都**不做零阶保持**，配不上的时刻一律整行丢弃：
+
+| `--imu-grid` | 栅格 | 另一条流怎么处理 | 代价 |
+| --- | --- | --- | --- |
+| `gyro`（默认） | 陀螺原始时刻，400 Hz | 加表**线性内插**到陀螺时刻 | 加表列是算出来的，设备在那个时刻并没有测过 |
+| `accel` | 加表原始时刻，250 Hz | 陀螺**取时间最近的实测样本**（抽稀，不造数） | 陀螺少 150 Hz；每行 `w` 可能偏 ±1.25 ms；30000 行要录约 120 s |
+
+要「一个样本都不造」就 `--imu-grid accel`；要陀螺速率就留着默认。选中的栅格、重采样方式、
+行速率与 `max_source_skew_ms`（抽稀模式下栅格时刻与所取陀螺样本的实际最大偏移）都写进
+`record_summary.yaml`，事后能从文件本身分辨两列哪些是实测、哪些是内插出来的。
+`verify` 对两列各报一个重复比例（`accel_hold_ratio` / `gyro_hold_ratio`），防止抽稀退化。
 
 ### 静止段重力方向核对
 

@@ -178,6 +178,7 @@ bool ParseImuCsv(const std::string& path,
     double max_gap = 0.0;
     double sum_gap = 0.0;
     std::size_t repeats = 0;
+    std::size_t gyro_repeats = 0;
     std::size_t bad_rows = 0;
     for (std::size_t index = 0; index < csv.size(); ++index) {
         const auto& fields = csv[index];
@@ -229,6 +230,9 @@ bool ParseImuCsv(const std::string& path,
             if (row.a == rows->back().a) {
                 ++repeats;
             }
+            if (row.w == rows->back().w) {
+                ++gyro_repeats;
+            }
         }
         previous = row.t_ns;
         rows->push_back(row);
@@ -244,14 +248,22 @@ bool ParseImuCsv(const std::string& path,
                 "imu.gap",
                 "最大相邻间隔 " + fmt::FormatDouble(max_gap) + " ms，上限 " +
                     fmt::FormatDouble(options.limits.max_imu_gap_ms) + " ms");
-    const double hold = static_cast<double>(repeats) / static_cast<double>(rows->size() - 1);
+    const double denominator = static_cast<double>(rows->size() - 1);
+    const double hold = static_cast<double>(repeats) / denominator;
     report->Add(hold > 0.05 ? CheckStatus::Warn : CheckStatus::Pass,
                 "imu.zero_order_hold",
                 "相邻行加表完全相同的比例 " + fmt::FormatDouble(hold * 100.0) +
                     " %（room_02 是 38%，来自 ROS 的零阶保持合并）");
-    report->mean_imu_gap_ms = sum_gap / static_cast<double>(rows->size() - 1);
+    // 抽稀栅格下陀螺才是可能被重复使用的那一列，所以两列都得看。
+    const double gyro_hold = static_cast<double>(gyro_repeats) / denominator;
+    report->Add(gyro_hold > 0.05 ? CheckStatus::Warn : CheckStatus::Pass,
+                "imu.gyro_repeat",
+                "相邻行陀螺完全相同的比例 " + fmt::FormatDouble(gyro_hold * 100.0) +
+                    " %（加表栅格抽稀时非零属正常，接近 1 - 加表/陀螺 才说明退化成零阶保持）");
+    report->mean_imu_gap_ms = sum_gap / denominator;
     report->max_imu_gap_ms = max_gap;
     report->accel_hold_ratio = hold;
+    report->gyro_hold_ratio = gyro_hold;
     report->imu_begin_ns = rows->front().t_ns;
     report->imu_end_ns = rows->back().t_ns;
     report->imu_rows = rows->size();
@@ -696,7 +708,7 @@ void PrintReport(const VerificationReport& report, std::FILE* stream) {
     }
     std::fprintf(stream,
                  "汇总: 双目 %zu/%zu 行（配对 %zu，丢弃 %zu），IMU %zu 行（最大间隔 %.3f ms，"
-                 "加表重复 %.1f%%），GT %zu 行\n",
+                 "加表重复 %.1f%%，陀螺重复 %.1f%%），GT %zu 行\n",
                  report.cam0_rows,
                  report.cam1_rows,
                  report.synced_pairs,
@@ -704,6 +716,7 @@ void PrintReport(const VerificationReport& report, std::FILE* stream) {
                  report.imu_rows,
                  report.max_imu_gap_ms,
                  report.accel_hold_ratio * 100.0,
+                 report.gyro_hold_ratio * 100.0,
                  report.gt_rows);
     if (report.boundary.has_value()) {
         std::fprintf(stream,

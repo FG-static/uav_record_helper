@@ -48,6 +48,7 @@ struct VerificationReport {
     double max_imu_gap_ms{0.0};
     double mean_imu_gap_ms{0.0};
     double accel_hold_ratio{0.0};
+    double gyro_hold_ratio{0.0};
     double max_frame_gap_ms{0.0};
     double static_accel_norm{0.0};
     TimeNs imu_begin_ns{0};

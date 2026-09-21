@@ -307,7 +307,7 @@ std::string DatasetWriter::CameraYaml(const CameraIntrinsics& camera,
     return yaml;
 }
 
-bool DatasetWriter::WriteCalibrationFiles(std::string* error) {
+bool DatasetWriter::WriteCalibrationFiles(const ImuAlignStats& imu_stats, std::string* error) {
     CameraIntrinsics camera0 = calibration_.camera0;
     CameraIntrinsics camera1 = calibration_.camera1;
     if (options_.zero_distortion) {
@@ -331,7 +331,9 @@ bool DatasetWriter::WriteCalibrationFiles(std::string* error) {
     imu_yaml += "sensor_type: imu\n";
     imu_yaml += "comment: accelerometer frame is the body frame B\n";
     imu_yaml += fmt::FormatMatrixField("T_BS", 4, 4, cal::FlattenT_BS(RigidTransform{}));
-    imu_yaml += "rate_hz: " + std::to_string(provenance_.imu_gyro_hz) + "\n";
+    // rate_hz 描述的是 data.csv 的行速率，不是设备上报的陀螺速率：抽稀模式下它是加表速率。
+    const double row_rate = imu_stats.grid_dt_ms > 0.0 ? 1e3 / imu_stats.grid_dt_ms : 0.0;
+    imu_yaml += "rate_hz: " + std::to_string(static_cast<long long>(std::llround(row_rate))) + "\n";
     imu_yaml += "gyroscope_noise_density: " + fmt::FormatDouble(noise_.sigma_g) + "\n";
     imu_yaml += "gyroscope_random_walk: " + fmt::FormatDouble(noise_.sigma_bg) + "\n";
     imu_yaml += "accelerometer_noise_density: " + fmt::FormatDouble(noise_.sigma_a) + "\n";
@@ -432,13 +434,23 @@ bool DatasetWriter::WriteSummary(const WriteResult& result,
     summary += "  depth0: camera_depth_optical_frame\n";
     summary += "  imu0: camera_accel_frame_is_body_frame\n";
     summary += "imu:\n";
-    summary += "  gyro_hz: " + fmt::FormatDouble(1e3 / imu_stats.grid_dt_ms) + "\n";
+    // 栅格与重采样方式必须写进留档：data.csv 的 gy/a 两列里哪些是设备实测、哪些是内插出来的，
+    // 只看文件本身分辨不出来。
+    summary += "  grid: " + std::string(ImuGridModeName(options_.imu_grid)) + " timestamps\n";
+    summary += "  resample: " +
+               std::string(options_.imu_grid == ImuGridMode::kGyroTimestamps
+                               ? "accel_linear_interpolation"
+                               : "gyro_nearest_measured_sample") +
+               "\n";
+    summary += "  row_rate_hz: " + fmt::FormatDouble(1e3 / imu_stats.grid_dt_ms) + "\n";
     summary += "  accel_raw_hz: " +
                fmt::FormatDouble(
                    imu_stats.accel_raw * 1e9 /
                    std::max(1.0, static_cast<double>(result.imu_end_ns - result.imu_begin_ns))) +
                "\n";
     summary += "  accel_hold_ratio: " + fmt::FormatDouble(imu_stats.accel_hold_ratio) + "\n";
+    summary += "  gyro_hold_ratio: " + fmt::FormatDouble(imu_stats.gyro_hold_ratio) + "\n";
+    summary += "  max_source_skew_ms: " + fmt::FormatDouble(imu_stats.max_source_skew_ms) + "\n";
     summary += "  max_gap_ms: " + fmt::FormatDouble(imu_stats.max_gap_ms) + "\n";
     summary += "  grid_dt_ms: " + fmt::FormatDouble(imu_stats.grid_dt_ms) + "\n";
     // 静止标定阶段实测的重力方向与 T_BS 第三列的夹角；这是「IMU 数据系 == 外参表所指系」的证据。
@@ -508,8 +520,12 @@ bool DatasetWriter::Finalize(const std::vector<GyroSample>& gyro,
     std::sort(depth_times.begin(), depth_times.end());
 
     AlignResult aligned;
-    if (!AlignImuStreams(
-            gyro, accel, ToNs(options_.limits.max_imu_gap_ms * 1e-3), &aligned, error)) {
+    if (!AlignImuStreams(gyro,
+                         accel,
+                         ToNs(options_.limits.max_imu_gap_ms * 1e-3),
+                         options_.imu_grid,
+                         &aligned,
+                         error)) {
         return false;
     }
     const ProbeConfig probe;
@@ -615,7 +631,7 @@ bool DatasetWriter::Finalize(const std::vector<GyroSample>& gyro,
                                    " 对图像会被回放的静止边界跳过，不影响初始化");
     }
 
-    if (!WriteCalibrationFiles(error) || !WriteImuCsv(rows, error) ||
+    if (!WriteCalibrationFiles(aligned.stats, error) || !WriteImuCsv(rows, error) ||
         !WriteCameraCsv(kept, error) ||
         (options_.write_depth && !WriteDepthCsv(kept_depth, error)) ||
         (options_.write_pose_gt && !WriteGroundTruthCsv(kept_poses, error))) {

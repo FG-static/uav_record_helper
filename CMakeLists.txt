@@ -78,15 +78,19 @@ endif()
 enable_testing()
 
 add_executable(rh_format_tests
+    src/record_helper/cli_common.cpp
     tests/test_png_io.cpp
     tests/test_euroc_format.cpp
     tests/test_calibration.cpp
     tests/test_imu_align.cpp
+    tests/test_cli_args.cpp
     tests/test_motion_gate.cpp
     tests/test_dataset_writer.cpp
     tests/test_verify.cpp
     tests/test_verify_room02.cpp
     tests/test_main.cpp)
-target_include_directories(rh_format_tests PRIVATE tests)
+# cli_common.hpp 在 src/record_helper 下：命令行取值要能被单测覆盖，否则 --imu-grid accel
+# 这类字符串选项被静默忽略也没人发现。
+target_include_directories(rh_format_tests PRIVATE tests src/record_helper)
 target_link_libraries(rh_format_tests PRIVATE record_helper_format)
 add_test(NAME format.contract COMMAND rh_format_tests)

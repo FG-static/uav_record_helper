@@ -103,15 +103,24 @@ void PrintRecordUsage() {
     std::printf(
         "用法: rh record [--out DIR] [--seq NAME] [--still 4] [--excite 3]\n"
         "                [--width 848] [--height 480] [--fps 30] [--serial S]\n"
-        "                [--pose-gt auto|on|off] [--no-pose-gt] [--no-depth] [--zero-distortion]\n"
-        "                [--projector on|off] [--exposure-us 3000] [--png-level 3] [--tail 0.2]\n"
+        "                [--imu-grid gyro|accel] [--pose-gt auto|on|off] [--no-pose-gt]\n"
+        "                [--no-depth] [--zero-distortion] [--projector on|off]\n"
+        "                [--exposure-us 3000] [--png-level 3] [--tail 0.2]\n"
         "                [--force] [--no-verify] [--duration SEC]\n"
         "\n"
         "  预热后自动等静止标定（--still）和温和激励（--excite）满足，然后进入正式录制。\n"
         "  正式录制不限时长、不看运动/静止：中途停住也不会改阶段。\n"
         "  只有手动结束才进尾部 IMU 覆盖：Enter 或 q 或 Ctrl-C 结束并出盘，x 放弃。\n"
         "  --still/--excite 是初始化前提，不能跳过。\n"
-        "  --duration 只作状态行建议时长（unav_vio 要 IMU >30000 行，约 80 s），到点不会自动停。\n");
+        "  --duration 只作状态行建议时长（unav_vio 要 IMU >30000 行，换算见 --imu-grid），"
+        "到点不会自动停。\n"
+        "  --imu-grid 决定 imu0/data.csv 的时间戳栅格（默认 gyro）：\n"
+        "    gyro  = 陀螺原始时刻当栅格（400 Hz），加表线性内插到这些时刻。陀螺保持全速率，\n"
+        "            但加表列是算出来的；30000 行约需 75 s。\n"
+        "    accel = 加表原始时刻当栅格（250 Hz），陀螺只保留离该时刻最近的实测样本（抽稀）。\n"
+        "            两列都是设备实测值，不造任何数，代价是陀螺降到加表速率；\n"
+        "            30000 行约需 120 s，且每行的 w 可能来自栅格时刻 ±1.25 ms 处的样本\n"
+        "            （实际最大偏移写进 record_summary.yaml 的 max_source_skew_ms）。\n");
 }
 
 } // namespace
@@ -120,7 +129,8 @@ int RunRecord(int argc, char** argv) {
     InstallSignalHandlers();
     ArgumentParser parser(argc, argv, "record");
     std::string error;
-    if (!parser.Parse()) {
+    // 这些选项的取值不是数字，必须声明，否则解析器会退回默认值。
+    if (!parser.Parse({"out", "seq", "serial", "imu-grid", "pose-gt", "projector"})) {
         std::printf("%s\n", error.c_str());
         return 2;
     }
@@ -137,6 +147,7 @@ int RunRecord(int argc, char** argv) {
                                          "height",
                                          "fps",
                                          "serial",
+                                         "imu-grid",
                                          "pose-gt",
                                          "no-pose-gt",
                                          "no-depth",
@@ -171,6 +182,13 @@ int RunRecord(int argc, char** argv) {
         return 2;
     }
 
+    ImuGridMode imu_grid = ImuGridMode::kGyroTimestamps;
+    const std::string imu_grid_text = parser.Value("imu-grid", "gyro");
+    if (!ParseImuGridMode(imu_grid_text, &imu_grid)) {
+        std::printf("--imu-grid 只能是 gyro 或 accel，收到: %s\n", imu_grid_text.c_str());
+        return 2;
+    }
+
     std::string out = parser.Value("out", ".");
     std::string seq = parser.Value("seq", DefaultSequenceName());
     if (!ValidSequenceName(seq)) {
@@ -196,6 +214,7 @@ int RunRecord(int argc, char** argv) {
     WriteOptions options;
     options.write_depth = stream.depth;
     options.write_pose_gt = stream.pose;
+    options.imu_grid = imu_grid;
     options.zero_distortion = parser.Has("zero-distortion");
     options.png_level = png_level;
     options.imu_tail_guard_ns = static_cast<TimeNs>(tail_seconds * 1e9);
@@ -239,7 +258,6 @@ int RunRecord(int argc, char** argv) {
         provenance.distortion_model0 = info.distortion_model0;
         provenance.distortion_model1 = info.distortion_model1;
         provenance.camera_fps = static_cast<int>(info.camera_fps);
-        provenance.imu_gyro_hz = static_cast<int>(info.gyro_hz);
         provenance.capture_note =
             "still=" + std::to_string(static_cast<int>(still_seconds * 10) / 10.0) +
             "s excite=" + std::to_string(static_cast<int>(excite_seconds * 10) / 10.0) + "s";
@@ -290,6 +308,19 @@ int RunRecord(int argc, char** argv) {
                 info.distortion_model0.c_str(),
                 info.distortion_model1.c_str(),
                 options.zero_distortion ? "（写出零畸变）" : "");
+    // 栅格决定 data.csv 的行速率，也就决定「过回放测试那条 30000 行下限要录多久」，
+    // 所以这个换算必须在录制开始前就说给操作者，而不是等出盘后 verify 才报。
+    const bool accel_is_grid = imu_grid == ImuGridMode::kAccelTimestamps;
+    const double grid_hz = accel_is_grid ? info.accel_hz : info.gyro_hz;
+    const std::size_t min_rows = VerifyOptions{}.min_imu_rows;
+    const double seconds_for_min_rows =
+        grid_hz > 0.0 ? static_cast<double>(min_rows) / grid_hz : 0.0;
+    std::printf("IMU 栅格: %s → 行速率约 %.0f Hz，攒够 %zu 行约需 %.0f s（%s）\n",
+                ImuGridModeName(imu_grid),
+                grid_hz,
+                min_rows,
+                seconds_for_min_rows,
+                accel_is_grid ? "两列都是设备实测值，陀螺被抽稀" : "加表列是内插出来的");
     // 预热阶段噪声还没实测，用一组占位正值只校验内参/外参；真实值在静止段结束时写入。
     ImuNoise placeholder_noise;
     placeholder_noise.sigma_a = placeholder_noise.sigma_g = 1e-3;
@@ -483,7 +514,15 @@ int RunRecord(int argc, char** argv) {
                             "中途停下不会改阶段。按 Enter / q / Ctrl-C 结束并进入收尾\n",
                             PhaseName(phase));
                 if (duration > 0.0) {
-                    std::printf("  建议至少 %.0f s（IMU 行数过 30000 大约要 80 s）\n", duration);
+                    std::printf("  建议至少 %.0f s（%s 栅格下过 %zu 行约需 %.0f s）\n",
+                                duration,
+                                ImuGridModeName(imu_grid),
+                                min_rows,
+                                seconds_for_min_rows);
+                    if (duration < seconds_for_min_rows) {
+                        std::printf("  注意: 建议时长不足，该栅格下会卡在 IMU 行数下限之下；"
+                                    "延长录制或改用 --imu-grid gyro\n");
+                    }
                 }
             }
         } else if (phase == Phase::Track) {
