@@ -39,9 +39,10 @@ RecordHelper 在录制端逐条堵住这些坑：**只写 flow 列表**、**噪�
 ### Linux
 
 ```bash
-# 按 Intel 文档装 librealsense2（含 udev）和 Eigen
+# 依赖：cmake / g++ / Eigen / zlib，外加一份能被 find_package 找到的 librealsense2
 sudo apt install cmake g++ libeigen3-dev zlib1g-dev
-# 若没走 Intel apt，至少让用户态能打开 D435i / hidraw：
+# 让用户态能打开 D435i 的 USB 与 IMU（Linux 上 IMU 走内核 hid_sensor/IIO，
+# 规则里 iio / hid_sensor 那两行是必需的，只有 usb+hidraw 会报 scan_element Permission denied）：
 sudo cp pack/99-realsense.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 # 拔插一次相机后再：
@@ -49,6 +50,17 @@ cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release --parallel
 ctest --test-dir build-release --output-on-failure
 ```
+
+`librealsense` 必须能被 `find_package(realsense2 CONFIG)` 找到。走 Intel 的 apt 源装
+`librealsense2-dev` 时上面那条命令就够了；用的是 ROS 二进制包
+（`sudo apt install ros-jazzy-librealsense2`，2.58.4，自带头文件和 CMake 配置）时，先
+`source /opt/ros/jazzy/setup.bash`，或者显式给前缀：
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/ros/jazzy
+```
+
+不这么做会在 configure 阶段就停在 `realsense2_DIR` 找不到上头。
 
 可执行文件是 `build-release/rh`，直接跑，一般不需要 sudo。
 
@@ -81,9 +93,15 @@ open -a Terminal /Users/mac/src/record_helper
 ```bash
 ./build-release/rh probe
 ./build-release/rh record --out ~/datasets --seq room_03 --exposure-us 3000
-./build-release/rh record --seq room_04 --still 5 --excite 4 --exposure-us 4000 --no-pose-gt
-./build-release/rh record --seq room_05 --imu-grid accel   # 两列都要实测值，陀螺抽稀到 250 Hz
+./build-release/rh record --out ~/datasets --seq room_04 --still 5 --excite 4 --exposure-us 4000 --no-pose-gt
+./build-release/rh record --out ~/datasets --seq room_05 --imu-grid accel   # 两列都要实测值，陀螺抽稀到 250 Hz
+./build-release/rh record --out ~/datasets --seq room_06 --no-depth --exposure-us 4000 --duration 90
 ```
+
+`--out` 默认是**当前目录**，不设就会把几百 MB 的包写进仓库里，示例里全部显式给。
+`--no-depth` 不写 `depth0`（unav_vio 根本不读它，只留档），实测 94 s / 2828 对双目无深度的包是
+**394 MB**；按 848×480 Z16 @ 30 fps 估算，带上深度大约再翻两三倍（这个数没实测过，只当量级看）。
+`record` 里没有剩余空间检查，`df -h` 先看一眼。
 
 | 阶段 | 谁推进 | 你做什么 |
 | --- | --- | --- |
@@ -136,13 +154,26 @@ RSUSB 后端 + 内核 hid-sensor/IIO）。换机器、换构建都要重看这�
 
 ## 回放
 
+`unav_vio` 侧先构建一次（它自己的 `find_package(uav_nav CONFIG REQUIRED)` 要求把 CMake 前缀
+指到已安装的 SDK；Ceres 要 2.2.0）：
+
+```bash
+cd <ace_unav>/modules/unav_vio
+cmake -S . -B build-replay -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH=<uav_nav 的 sdk-install>
+cmake --build build-replay --target vio_mh01_replay_test --parallel
+```
+
+然后指着我们录的目录跑：
+
 ```bash
 env UNAV_VIO_EUROC_MH01=~/datasets/room_03 \
     UNAV_VIO_MH01_MAX_FRAMES=300 \
-    ctest --test-dir <unav_vio build> -R mh01_replay --output-on-failure
+    ctest --test-dir build-replay -R '^integration.mh01_replay$' --output-on-failure
 ```
 
 数据集根目录直接就是 `UNAV_VIO_EUROC_MH01` 该指的地方，不需要任何中转脚本。
+`-R` 请写全名：`-R mh01_replay` 会连 `integration.mh01_replay_rerun` 一起跑，时间翻倍
+（Debug 下 300 帧单次约 5 分钟）。`MAX_FRAMES` 不设时默认也是 300，想跑完整段写 `0`。
 
 设备没有位姿流（`--no-pose-gt`，或本机这种根本不枚举 `RS2_STREAM_POSE` 的构建）时，包里就没有
 `state_groundtruth_estimate0/`。加 `UNAV_VIO_MH01_REQUIRE_GT=0` 可以让上游回放测试只放弃「轨迹精度」
@@ -152,8 +183,28 @@ env UNAV_VIO_EUROC_MH01=~/datasets/room_03 \
 ```bash
 env UNAV_VIO_EUROC_MH01=~/datasets/room_03 UNAV_VIO_MH01_MAX_FRAMES=300 \
     UNAV_VIO_MH01_REQUIRE_GT=0 \
-    ctest --test-dir <unav_vio build> -R mh01_replay --output-on-failure
+    ctest --test-dir build-replay -R '^integration.mh01_replay$' --output-on-failure
 ```
+
+跑完想留可看的东西，再加两个变量：`UNAV_VIO_REPLAY_ARTIFACT_DIR=<空目录>` 落
+`estimated.tum` / `trace.csv` / `manifest.json` / `metrics.json`（该目录必须为空，它拒绝覆盖），
+`UNAV_VIO_RERUN_SAVE=<路径>.rrd` 录 Rerun 记录，事后用 Rerun viewer 打开：
+
+```bash
+env UNAV_VIO_EUROC_MH01=~/datasets/room_03 UNAV_VIO_MH01_MAX_FRAMES=300 \
+    UNAV_VIO_MH01_REQUIRE_GT=0 \
+    UNAV_VIO_RERUN_SAVE=/tmp/room_03.rrd UNAV_VIO_REPLAY_ARTIFACT_DIR=/tmp/room_03-artifacts \
+    ./build-replay/vio_mh01_replay_test
+<rerun 可执行> /tmp/room_03.rrd      # 或加 --serve-web 后用浏览器打开它打印的地址
+```
+
+Rerun 查看器不在 PATH 里，也不随本项目安装：它得是 **0.37.x**（`uav_nav_rerun 0.5.0` 传递依赖
+`rerun_sdk 0.37.1 EXACT`），本机用的是 `~/桌面/rerun-cli-0.37.1-x86_64-unknown-linux-gnu`。
+`.rrd` 是否完整可以用 `rerun rrd verify <文件>` 判。
+
+live 推流（边跑边看）与 SAVE 互斥：先 `rerun --serve-web --bind 127.0.0.1 --port 9876`，
+再用 `--connect` 跑，并且**不要**同时给 `UNAV_VIO_RERUN_SAVE`——回放侧的连接端点是写死的
+`rerun+http://127.0.0.1:9876/proxy`。
 
 ## 产物结构
 
