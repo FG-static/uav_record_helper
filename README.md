@@ -172,14 +172,20 @@ env UNAV_VIO_EUROC_MH01=~/datasets/room_03 UNAV_VIO_MH01_MAX_FRAMES=300 \
 
 ## 已知边界
 
-- 只做录制，不做相机驱动、不做估计、不改 `unav_vio`。
+- 只做录制，不做相机驱动、不做估计。本工具不改 `unav_vio`；上游判据要放宽还是收紧，是你在
+  那个仓库里单独决定的事（下面 `REQUIRE_GT` 那条就是这么来的）。
 - 每条格式约束对应的 `unav_vio` 判定点、room_02 的逐项诊断，以及「哪些东西根本无法用数据集
   文件表达」写在 [`docs/format-contract.md`](docs/format-contract.md)。改动上游解析器时按它复核。
 - 伪 GT 来自设备内部 HLSL SLAM，是**另一个算法的输出**：指标只能当相对偏差看，
-  不构成绝对精度声明。`--no-pose-gt` 可以完全不录 GT，但当前
-  `tests/integration/vio_mh01_replay_test.cpp` 会硬性加载 GT 文件并在缺文件时早退
-  （见 `docs/format-contract.md` 里那一行断言）；想「仅回放不评估」需要在上游放宽那条断言，
-  RecordHelper 这边不替你改。
+  不构成绝对精度声明。`--no-pose-gt` 可以完全不录 GT。上游 `integration.mh01_replay` 原先在
+  缺 GT 时直接早退，连估计链都跑不到；现在它提供
+  `UNAV_VIO_MH01_REQUIRE_GT=0`（默认仍是必须有 GT，只有精确写 `0` 才降级，结论行会印
+  `require_gt=`），只放弃轨迹指标那一层——用法见上面「回放」小节。
+- **IMU 必须逐帧取，不能按 frameset 取**：`pipeline::wait_for_frames()` 返回的 frameset
+  每个流最多带一帧，用它取 IMU 会把 400/250 Hz 抽稀到相机帧率（30 Hz），栅格间隔立刻超
+  上游的 10 ms 上限，而其余检查全都照过。`capture.cpp` 因此走带回调的 `start()`。
+  `probe` 会按实测秒数报告两路 IMU 的真实采样率，任一低于请求值的 80 % 就打 `[FAIL]`
+  并以退出码 1 结束——换 SDK 构建、换后端、换内核驱动之后先跑一次它。
 - **位姿流不是想要就有的**：本机 `ros-jazzy-librealsense2` 2.58.4（RSUSB 后端）枚举到的六种流
   只有 `Infrared_1/2、Depth、Color、Accel、Gyro`，**没有 Pose**，所以 `--pose-gt auto` 会静默降级成
   不写 GT、`probe` 报「位姿流不可用」。要伪 GT 得先换一个会暴露该流的构建/固件，别指望改录制端。
