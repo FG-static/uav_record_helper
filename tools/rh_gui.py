@@ -515,16 +515,22 @@ class App:
                      "-DCMAKE_PREFIX_PATH=<uav_nav 的 sdk-install>")
             self.log(f"  cmake --build {build} --target vio_mh01_replay_test --parallel")
             return
-        rrd = Path(self.replay_fields["rrd"].get())
-        artifacts = Path(self.replay_fields["artifacts"].get())
-        if artifacts.exists() and any(artifacts.iterdir()):
+        # 留空 = 不要那份产物：replay_env 收到 None 就不设对应环境变量，
+        # 省得 Path("") 变成 "." 传给子进程当输出路径。
+        rrd_raw = self.replay_fields["rrd"].get().strip()
+        art_raw = self.replay_fields["artifacts"].get().strip()
+        rrd = Path(rrd_raw) if rrd_raw else None
+        artifacts = Path(art_raw) if art_raw else None
+        if artifacts is not None and artifacts.exists() and any(artifacts.iterdir()):
             self.log(f"[错误] 产物目录非空，回放侧拒绝覆盖：{artifacts}")
             return
-        if rrd.exists():
+        if rrd is not None and rrd.exists():
             self.log(f"[提示] 将覆盖已有 .rrd：{rrd}")
         frames = int(self.replay_fields["max_frames"].get() or 0)
         self.log(f"回放 {dataset.name}：MAX_FRAMES={frames}，"
-                 f"require_gt={'1' if self.require_gt.get() else '0'}（Debug 下 300 帧约 5 分钟）")
+                 f"require_gt={'1' if self.require_gt.get() else '0'}，"
+                 f"{'.rrd → ' + str(rrd) if rrd else '不存 .rrd（字段留空了）'}"
+                 f"（Debug 下 300 帧约 5 分钟）")
         self.spawn([str(binary)], replay_env(dataset, frames, self.require_gt.get(), rrd, artifacts))
         # 启动失败时 spawn 只留一行日志、self.process 仍为 None：这时别把按钮锁死。
         if self.process is not None:
@@ -533,11 +539,15 @@ class App:
 
     def open_viewer(self) -> None:
         viewer = rerun_viewer()
-        rrd = Path(self.replay_fields["rrd"].get())
+        rrd_raw = self.replay_fields["rrd"].get().strip()
         if viewer is None:
             self.log("[错误] 没找到 Rerun 查看器（PATH 与 ~/桌面 都没有 rerun-cli-*）。"
                      "它必须是 0.37.x，且不随本项目安装。")
             return
+        if not rrd_raw:
+            self.log("[提示] 「输出 .rrd」是空的：填好路径再回放一次才会有文件可开")
+            return
+        rrd = Path(rrd_raw)
         if self.writing_rrd is not None:
             self.log(f"[提示] 回放还在写 {self.writing_rrd}：.rrd 的 footer 只在写入方关闭文件时才写上，"
                      "这时打开只会得到 “Missing RRD footer / no RRD manifests”。"
@@ -584,6 +594,9 @@ def selftest(root_dir: Path) -> int:
     check(env["UNAV_VIO_MH01_MAX_FRAMES"] == "300", "MAX_FRAMES 落到环境")
     check("UNAV_VIO_REPLAY_ARTIFACT_DIR" not in env and env["UNAV_VIO_RERUN_SAVE"] == "/tmp/a.rrd",
           "只设给过路径的那两个产物变量")
+    bare = replay_env(Path("/d/room_07"), 0, True, None, None)
+    check("UNAV_VIO_RERUN_SAVE" not in bare and "UNAV_VIO_REPLAY_ARTIFACT_DIR" not in bare,
+          ".rrd/产物字段留空就是不存，不会把 '.' 传给子进程")
 
     check(record_problems(cfg, Path("/")) == [], "合法参数不该报警")
     bad = dict(cfg, seq="has space", still="1", excite="1", tail="0", duration="10")
