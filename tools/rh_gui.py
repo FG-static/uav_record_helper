@@ -98,8 +98,13 @@ def build_verify_command(rh: Path, dataset: Path, no_gt_required: bool, deep: bo
     return argv
 
 
+# 实测（d435i_20260924_164630，MAX_FRAMES=20 → .rrd 5,500,731 B）：画面是渲染成 RGB8 的叠加图，
+# 不是原始 PNG，所以每帧对约 0.28 MB；开整段 5400 帧就要 1.5 GB 量级，值得提前告诉用户。
+RRD_IMAGE_BYTES_PER_FRAME = 2.75e5
+
+
 def replay_env(dataset: Path, max_frames: int, require_gt: bool, rrd: Path | None,
-               artifacts: Path | None) -> dict[str, str]:
+               artifacts: Path | None, rerun_images: bool = False) -> dict[str, str]:
     env = {
         "UNAV_VIO_EUROC_MH01": str(dataset),
         "UNAV_VIO_MH01_MAX_FRAMES": str(max_frames),
@@ -108,6 +113,9 @@ def replay_env(dataset: Path, max_frames: int, require_gt: bool, rrd: Path | Non
     }
     if rrd is not None:
         env["UNAV_VIO_RERUN_SAVE"] = str(rrd)
+        # 上游把画面写在 live 请求或显式开关上，SAVE 模式默认不落图，所以这里必须显式打开。
+        if rerun_images:
+            env["UNAV_VIO_RERUN_IMAGES"] = "1"
     if artifacts is not None:
         env["UNAV_VIO_REPLAY_ARTIFACT_DIR"] = str(artifacts)
     return env
@@ -395,6 +403,7 @@ class App:
             "artifacts": tk.StringVar(value="/tmp/rh_gui-artifacts"),
         }
         self.require_gt = tk.BooleanVar(value=False)
+        self.rerun_images = tk.BooleanVar(value=True)
         # 最后一步是选法：dir 选已有目录，save 给还没写出来的 .rrd，None 是数字输入不给按钮。
         labels = (("unav_vio 构建目录", "build", 44, "dir"),
                   ("MAX_FRAMES（0=整段）", "max_frames", 8, None),
@@ -410,6 +419,8 @@ class App:
                     row=row, column=2, sticky="w", padx=(6, 0))
         ttk.Checkbutton(frame, text="要求 GT（本机没有位姿流，默认关）",
                         variable=self.require_gt).grid(row=len(labels), column=1, sticky="w")
+        ttk.Checkbutton(frame, text="把双目画面写进 .rrd（约 0.3 MB/帧）",
+                        variable=self.rerun_images).grid(row=len(labels), column=2, sticky="w")
         buttons = ttk.Frame(frame)
         buttons.grid(row=len(labels) + 1, column=1, columnspan=2, sticky="w", pady=4)
         self.replay_button = ttk.Button(buttons, text="回放选中数据集", command=self.run_replay)
@@ -527,11 +538,25 @@ class App:
         if rrd is not None and rrd.exists():
             self.log(f"[提示] 将覆盖已有 .rrd：{rrd}")
         frames = int(self.replay_fields["max_frames"].get() or 0)
+        with_images = self.rerun_images.get() and rrd is not None
+        if self.rerun_images.get() and rrd is None:
+            self.log("[提示] 勾了「把画面写进 .rrd」但 .rrd 是空的：没有文件可落，画面也就没了")
+        if with_images:
+            need = frames * RRD_IMAGE_BYTES_PER_FRAME
+            picture = (f"含双目画面（约 {need / 1e6:.0f} MB）" if frames
+                       else "含双目画面（整段，帧数未知）")
+            free = disk_free(rrd.parent) if frames else None
+            if free is not None and free < need * 1.5:
+                self.log(f"[提示] {rrd.parent} 只剩 {free / 1e6:.0f} MB，含画面的 .rrd 估算 "
+                         f"{need / 1e6:.0f} MB，写满会整段报废")
+        else:
+            picture = "只有轨迹/点云，没有画面"
         self.log(f"回放 {dataset.name}：MAX_FRAMES={frames}，"
                  f"require_gt={'1' if self.require_gt.get() else '0'}，"
-                 f"{'.rrd → ' + str(rrd) if rrd else '不存 .rrd（字段留空了）'}"
+                 f"{'.rrd → ' + str(rrd) if rrd else '不存 .rrd（字段留空了）'}，{picture}"
                  f"（Debug 下 300 帧约 5 分钟）")
-        self.spawn([str(binary)], replay_env(dataset, frames, self.require_gt.get(), rrd, artifacts))
+        self.spawn([str(binary)], replay_env(dataset, frames, self.require_gt.get(),
+                                             rrd, artifacts, self.rerun_images.get()))
         # 启动失败时 spawn 只留一行日志、self.process 仍为 None：这时别把按钮锁死。
         if self.process is not None:
             self.replay_button.configure(state="disabled")
@@ -597,6 +622,13 @@ def selftest(root_dir: Path) -> int:
     bare = replay_env(Path("/d/room_07"), 0, True, None, None)
     check("UNAV_VIO_RERUN_SAVE" not in bare and "UNAV_VIO_REPLAY_ARTIFACT_DIR" not in bare,
           ".rrd/产物字段留空就是不存，不会把 '.' 传给子进程")
+    # SAVE 模式默认不落图（上游 vio_mh01_replay_test.cpp 的 stereo_images 判定），必须显式开。
+    check("UNAV_VIO_RERUN_IMAGES" not in replay_env(Path("/d"), 300, False, Path("/t/a.rrd"), None),
+          "不开开关时 .rrd 里只有轨迹，行为与上游默认一致")
+    check(replay_env(Path("/d"), 300, False, Path("/t/a.rrd"), None, True)["UNAV_VIO_RERUN_IMAGES"] == "1",
+          "勾了画面就设 UNAV_VIO_RERUN_IMAGES=1")
+    check("UNAV_VIO_RERUN_IMAGES" not in replay_env(Path("/d"), 300, False, None, None, True),
+          "没有 .rrd 就没有落图的地方，不该设这个变量")
 
     check(record_problems(cfg, Path("/")) == [], "合法参数不该报警")
     bad = dict(cfg, seq="has space", still="1", excite="1", tail="0", duration="10")

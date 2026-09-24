@@ -189,15 +189,22 @@ env UNAV_VIO_EUROC_MH01=~/datasets/room_03 UNAV_VIO_MH01_MAX_FRAMES=300 \
 
 跑完想留可看的东西，再加两个变量：`UNAV_VIO_REPLAY_ARTIFACT_DIR=<空目录>` 落
 `estimated.tum` / `trace.csv` / `manifest.json` / `metrics.json`（该目录必须为空，它拒绝覆盖），
-`UNAV_VIO_RERUN_SAVE=<路径>.rrd` 录 Rerun 记录，事后用 Rerun viewer 打开：
+`UNAV_VIO_RERUN_SAVE=<路径>.rrd` 录 Rerun 记录，事后用 Rerun viewer 打开。**SAVE 模式默认不写
+相机画面**（只有轨迹/点云/坐标轴）——上游把画面留给 live 模式或显式开关，免得整段双目原图落盘；
+要画面就得再加 `UNAV_VIO_RERUN_IMAGES=1`：
 
 ```bash
 env UNAV_VIO_EUROC_MH01=~/datasets/room_03 UNAV_VIO_MH01_MAX_FRAMES=300 \
     UNAV_VIO_MH01_REQUIRE_GT=0 \
     UNAV_VIO_RERUN_SAVE=/tmp/room_03.rrd UNAV_VIO_REPLAY_ARTIFACT_DIR=/tmp/room_03-artifacts \
+    UNAV_VIO_RERUN_IMAGES=1 \
     ./build-replay/vio_mh01_replay_test
 <rerun 可执行> /tmp/room_03.rrd      # 或加 --serve-web 后用浏览器打开它打印的地址
 ```
+
+画面是叠加了特征跟踪结果后渲染成 RGB8 的图，不是原始 PNG，实测约 **0.28 MB/帧对**（848x480
+双目，`d435i_20260924_164630` 跑 20 帧得 5.5 MB）：300 帧约 82 MB，整段五千多帧就是 1.5 GB 量级。
+结论行里的 `rerun_image_records=帧数×2` 就是"画面真的进去了"的证据，为 0 说明这个变量没生效。
 
 Rerun 查看器不在 PATH 里，也不随本项目安装：它得是 **0.37.x**（`uav_nav_rerun 0.5.0` 传递依赖
 `rerun_sdk 0.37.1 EXACT`），本机用的是 `~/桌面/rerun-cli-0.37.1-x86_64-unknown-linux-gnu`。
@@ -227,7 +234,10 @@ python3 tools/rh_gui.py --smoke    # 构造界面 1.5 s 后自动关闭，验证
   刷新列表会保留你的选中项。
 - **回放**：直接调 unav_vio 构建目录里的 `vio_mh01_replay_test`，环境变量与上面「回放」小节
   完全一致（`UNAV_VIO_MH01_REQUIRE_GT`、`MAX_FRAMES`、`UNAV_VIO_RERUN_SAVE`、
-  `UNAV_VIO_REPLAY_ARTIFACT_DIR`）；产物目录非空时先自己拒绝，而不是等子进程报"拒绝覆盖"。
+  `UNAV_VIO_REPLAY_ARTIFACT_DIR`、`UNAV_VIO_RERUN_IMAGES`）；产物目录非空时先自己拒绝，
+  而不是等子进程报"拒绝覆盖"。
+  「把双目画面写进 .rrd」默认**勾上**（界面是给人看东西的），日志会先按 0.28 MB/帧估一次体积并
+  对比目标盘余量；取消勾选就回到上游 SAVE 的默认行为，只有轨迹和点云。
   三个路径框都带「浏览…」按钮，其中「输出 .rrd」用的是**另存为**对话框——那个文件通常还没
   生成，拿目录选择器会逼你先手工建一个文件。
   「打开 Rerun viewer」先找 PATH 里的 `rerun`，找不到再找 `~/桌面/rerun-cli-*`。它是另开一个
