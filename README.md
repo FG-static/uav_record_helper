@@ -228,7 +228,12 @@ python3 tools/rh_gui.py --smoke    # 构造界面 1.5 s 后自动关闭，验证
 - **回放**：直接调 unav_vio 构建目录里的 `vio_mh01_replay_test`，环境变量与上面「回放」小节
   完全一致（`UNAV_VIO_MH01_REQUIRE_GT`、`MAX_FRAMES`、`UNAV_VIO_RERUN_SAVE`、
   `UNAV_VIO_REPLAY_ARTIFACT_DIR`）；产物目录非空时先自己拒绝，而不是等子进程报"拒绝覆盖"。
-  「打开 Rerun viewer」先找 PATH 里的 `rerun`，找不到再找 `~/桌面/rerun-cli-*`。
+  三个路径框都带「浏览…」按钮，其中「输出 .rrd」用的是**另存为**对话框——那个文件通常还没
+  生成，拿目录选择器会逼你先手工建一个文件。
+  「打开 Rerun viewer」先找 PATH 里的 `rerun`，找不到再找 `~/桌面/rerun-cli-*`。它是另开一个
+  进程去**读**那个 `.rrd`，所以点它不会打断回放；真正的问题是时机——`.rrd` 的 footer 只在写入方
+  关闭文件时才写上，回放途中打开只会得到 `Missing RRD footer / no RRD manifests`。因此日志出现
+  「.rrd 已写完并关闭」之前，界面会拦下这一击。
 
 子进程输出都在后台线程读管道、经队列回主线程刷新，所以回放跑五分钟界面不冻结。
 

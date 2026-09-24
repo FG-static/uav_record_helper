@@ -177,6 +177,18 @@ def record_problems(cfg: dict, out_dir: Path) -> list[str]:
     return problems
 
 
+def nearest_existing_dir(path: Path) -> Path:
+    """文件选择框的 initialdir 必须真实存在，否则 tkinter 会悄悄退回上次的目录。
+
+    界面里的默认值经常还没被创建（unav_vio 的 build-replay、产物目录），所以逐级向上找；
+    绝对路径的链条最坏到根目录，一定能停下。
+    """
+    candidate = path if path.is_absolute() else Path.cwd() / path
+    while not candidate.is_dir() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
+
+
 def dir_size(path: Path) -> int:
     total = 0
     for root, _, files in os.walk(path):
@@ -219,6 +231,8 @@ class App:
         self.rh = find_rh(root_dir)
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.process: subprocess.Popen | None = None
+        # 只有回放会往 .rrd 里写；探测/校验跑着的时候开 viewer 没有顾虑，所以单独记这一点。
+        self.writing_rrd: Path | None = None
 
         self.root = tk.Tk()
         self.root.title("RecordHelper")
@@ -249,6 +263,9 @@ class App:
         if self.process is not None and self.process.poll() is not None:
             self.log(f"[退出码 {self.process.returncode}]")
             self.process = None
+            if self.writing_rrd is not None:
+                self.log(f".rrd 已写完并关闭：{self.writing_rrd}（现在可以打开 viewer 了）")
+                self.writing_rrd = None
             self.replay_button.configure(state="normal")
         self.root.after(120, self._pump)
 
@@ -378,19 +395,27 @@ class App:
             "artifacts": tk.StringVar(value="/tmp/rh_gui-artifacts"),
         }
         self.require_gt = tk.BooleanVar(value=False)
-        labels = (("unav_vio 构建目录", "build", 44), ("MAX_FRAMES（0=整段）", "max_frames", 8),
-                  ("输出 .rrd", "rrd", 44), ("产物目录（必须为空）", "artifacts", 44))
-        for row, (label, key, width) in enumerate(labels):
+        # 最后一步是选法：dir 选已有目录，save 给还没写出来的 .rrd，None 是数字输入不给按钮。
+        labels = (("unav_vio 构建目录", "build", 44, "dir"),
+                  ("MAX_FRAMES（0=整段）", "max_frames", 8, None),
+                  ("输出 .rrd", "rrd", 44, "save"),
+                  ("产物目录（必须为空）", "artifacts", 44, "dir"))
+        for row, (label, key, width, style) in enumerate(labels):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="e", padx=6, pady=2)
             ttk.Entry(frame, textvariable=self.replay_fields[key], width=width).grid(
                 row=row, column=1, sticky="w")
+            if style:
+                ttk.Button(frame, text="浏览…", width=7,
+                           command=lambda k=key, s=style: self.pick_replay_path(k, s)).grid(
+                    row=row, column=2, sticky="w", padx=(6, 0))
         ttk.Checkbutton(frame, text="要求 GT（本机没有位姿流，默认关）",
                         variable=self.require_gt).grid(row=len(labels), column=1, sticky="w")
         buttons = ttk.Frame(frame)
-        buttons.grid(row=len(labels) + 1, column=1, sticky="w", pady=4)
+        buttons.grid(row=len(labels) + 1, column=1, columnspan=2, sticky="w", pady=4)
         self.replay_button = ttk.Button(buttons, text="回放选中数据集", command=self.run_replay)
         self.replay_button.pack(side="left", padx=4)
         ttk.Button(buttons, text="打开 Rerun viewer", command=self.open_viewer).pack(side="left", padx=4)
+        ttk.Label(buttons, text="viewer 打开的是文件，不会打断回放").pack(side="left", padx=6)
 
     # --- 动作 -------------------------------------------------------------
 
@@ -405,9 +430,25 @@ class App:
 
     def pick_out_dir(self) -> None:
         from tkinter import filedialog
-        chosen = filedialog.askdirectory(initialdir=self.fields["out"].get() or str(Path.home()))
+        start = Path(self.fields["out"].get() or str(Path.home()))
+        chosen = filedialog.askdirectory(initialdir=str(nearest_existing_dir(start)))
         if chosen:
             self.fields["out"].set(chosen)
+
+    def pick_replay_path(self, key: str, style: str) -> None:
+        """dir 只能选存在的目录；.rrd 往往还没生成，所以它走 save 对话框，别拿 askdirectory 逼用户先建文件。"""
+        from tkinter import filedialog
+
+        base = Path(self.replay_fields[key].get() or str(Path.home()))
+        if style == "save":
+            chosen = filedialog.asksaveasfilename(
+                initialdir=str(nearest_existing_dir(base.parent if base.suffix else base)),
+                initialfile=base.name if base.suffix else "",
+                defaultextension=".rrd", filetypes=[("Rerun 文档", "*.rrd"), ("所有文件", "*")])
+        else:
+            chosen = filedialog.askdirectory(initialdir=str(nearest_existing_dir(base)))
+        if chosen:
+            self.replay_fields[key].set(chosen)
 
     def check_record(self) -> None:
         problems = record_problems(self.record_cfg(), Path(self.fields["out"].get()))
@@ -484,8 +525,11 @@ class App:
         frames = int(self.replay_fields["max_frames"].get() or 0)
         self.log(f"回放 {dataset.name}：MAX_FRAMES={frames}，"
                  f"require_gt={'1' if self.require_gt.get() else '0'}（Debug 下 300 帧约 5 分钟）")
-        self.replay_button.configure(state="disabled")
         self.spawn([str(binary)], replay_env(dataset, frames, self.require_gt.get(), rrd, artifacts))
+        # 启动失败时 spawn 只留一行日志、self.process 仍为 None：这时别把按钮锁死。
+        if self.process is not None:
+            self.replay_button.configure(state="disabled")
+            self.writing_rrd = rrd
 
     def open_viewer(self) -> None:
         viewer = rerun_viewer()
@@ -493,6 +537,11 @@ class App:
         if viewer is None:
             self.log("[错误] 没找到 Rerun 查看器（PATH 与 ~/桌面 都没有 rerun-cli-*）。"
                      "它必须是 0.37.x，且不随本项目安装。")
+            return
+        if self.writing_rrd is not None:
+            self.log(f"[提示] 回放还在写 {self.writing_rrd}：.rrd 的 footer 只在写入方关闭文件时才写上，"
+                     "这时打开只会得到 “Missing RRD footer / no RRD manifests”。"
+                     "等日志出现「已写完并关闭」再点。")
             return
         if not rrd.is_file():
             self.log(f"[提示] {rrd} 还不存在，先跑一次回放")
@@ -572,6 +621,12 @@ def selftest(root_dir: Path) -> int:
               "list_datasets 给出的是原始路径，不是显示串（选中项靠序号而不是解析文本）")
         check(rows[0][2] == "无GT,无深度", "备注同时认出缺 GT 和缺深度")
         check(dir_size(good) > 0, "dir_size 统计到内容")
+        # 选择框的 initialdir 必须是真实目录，否则 tkinter 会退回上次的目录，用户看不出为什么。
+        check(nearest_existing_dir(good / "mav0") == good / "mav0", "已存在的目录原样给出")
+        check(nearest_existing_dir(good / "mav0" / "nope" / "deeper") == good / "mav0",
+              "还没建出来的默认路径向上退到存在的父目录")
+        check(nearest_existing_dir(Path("/no/such/place")).is_dir(),
+              "任意绝对路径都能停在一个真实目录（最坏是根）")
 
     print(f"[info] rh：{find_rh(root_dir) or '未构建'}")
     print(f"[info] Rerun viewer：{rerun_viewer() or '未找到'}")
