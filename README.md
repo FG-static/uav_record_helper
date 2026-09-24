@@ -3,7 +3,8 @@
 给 Intel RealSense D435i 用的一键录制工具：把双目红外 + IMU（+ 深度、设备端位姿）录成
 `unav_vio` 回放侧**可以直接吃**的 EuRoC 风格数据集，录完立刻自检，不用再做二次转换。
 
-纯命令行，无 GUI，无 ROS，无 OpenCV，无 Ceres。依赖只有 `librealsense`、`Eigen`、`zlib`。
+C++ 侧纯命令行，无 GUI 库、无 ROS、无 OpenCV、无 Ceres，依赖只有 `librealsense`、`Eigen`、`zlib`。
+另有一个**可选**的 Python/tkinter 驱动层 `tools/rh_gui.py`：它不链接进库，只是把命令行按顺序调起来。
 
 ```
 rh probe    # 读设备能力：内参/外参/IMU 速率/时间戳域/两目几何摘要（不写文件）
@@ -205,6 +206,31 @@ Rerun 查看器不在 PATH 里，也不随本项目安装：它得是 **0.37.x**
 live 推流（边跑边看）与 SAVE 互斥：先 `rerun --serve-web --bind 127.0.0.1 --port 9876`，
 再用 `--connect` 跑，并且**不要**同时给 `UNAV_VIO_RERUN_SAVE`——回放侧的连接端点是写死的
 `rerun+http://127.0.0.1:9876/proxy`。
+
+## 图形界面（可选）
+
+```bash
+python3 tools/rh_gui.py            # 需要 DISPLAY
+python3 tools/rh_gui.py --selftest # 无界面检查参数拼装与磁盘估算，不需要 DISPLAY
+python3 tools/rh_gui.py --smoke    # 构造界面 1.5 s 后自动关闭，验证布局代码不抛异常
+```
+
+它只是把上面几节的命令按顺序调起来，**不给 C++ 库引入任何依赖**（tkinter 是标准库自带的）。
+
+- **设备**：跑 `rh probe`，输出进界面日志。
+- **录制**：填参数 →「检查参数与磁盘」做离线预演（`--still/--excite/--tail` 的下限、
+  `--duration` 在当前栅格下够不够 30001 行 IMU、目标盘余量对比估算体积）→
+  「在终端里开始录制」用 `gnome-terminal`/`konsole`/`xterm` 开一个**真实终端**跑 `rh record`。
+  阶段推进（Enter / q / x）和你拿相机走动都在那个窗口里——把键盘塞进管道会让"操作员看着
+  终端决定何时停"这个前提失效，所以这里刻意不做内嵌伪终端。
+- **数据集**：列 `<输出目录>/*/mav0`，标出大小与缺不缺 GT/深度；选中后跑 `rh verify`，
+  刷新列表会保留你的选中项。
+- **回放**：直接调 unav_vio 构建目录里的 `vio_mh01_replay_test`，环境变量与上面「回放」小节
+  完全一致（`UNAV_VIO_MH01_REQUIRE_GT`、`MAX_FRAMES`、`UNAV_VIO_RERUN_SAVE`、
+  `UNAV_VIO_REPLAY_ARTIFACT_DIR`）；产物目录非空时先自己拒绝，而不是等子进程报"拒绝覆盖"。
+  「打开 Rerun viewer」先找 PATH 里的 `rerun`，找不到再找 `~/桌面/rerun-cli-*`。
+
+子进程输出都在后台线程读管道、经队列回主线程刷新，所以回放跑五分钟界面不冻结。
 
 ## 产物结构
 
