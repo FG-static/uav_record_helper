@@ -202,9 +202,27 @@ env UNAV_VIO_EUROC_MH01=~/datasets/room_03 UNAV_VIO_MH01_MAX_FRAMES=300 \
 <rerun 可执行> /tmp/room_03.rrd      # 或加 --serve-web 后用浏览器打开它打印的地址
 ```
 
-画面是叠加了特征跟踪结果后渲染成 RGB8 的图，不是原始 PNG，实测约 **0.28 MB/帧对**（848x480
-双目，`d435i_20260924_164630` 跑 20 帧得 5.5 MB）：300 帧约 82 MB，整段五千多帧就是 1.5 GB 量级。
-结论行里的 `rerun_image_records=帧数×2` 就是"画面真的进去了"的证据，为 0 说明这个变量没生效。
+画面是叠加了特征跟踪结果后渲染成 RGB8 的图，不是原始 PNG，实测约 **0.31 MB/帧对**（848x480
+双目，`d435i_20260924_164630` 跑 300 帧得 93.6 MB、`rerun_image_records=600`）：整段五千多帧就
+是 1.7 GB 量级。结论行里的 `rerun_image_records=帧数×2` 就是"画面真的进去了"的证据，为 0 说明这个
+变量没生效。
+（0.31 MB 是**没画标记**时量的：标记绘制是 unav_vio 提交 `0f38114`（09-24）才有的，旧二进制写出来的
+`.rrd` 里相机面板是纯灰度图——判据很简单，灰度图每个像素 R=G=B。用新二进制重跑，实测约 0.55 MB/帧对。）
+
+### 换到较新的 unav_vio 后回放会多出的两道门
+
+这两道门都在回放测试里，录制端管不着，但会直接让"昨天还能跑"的数据集今天跑不动：
+
+1. **图像质量前置门**：`image_quality=fail ... 拉普拉斯方差中位数=1.9 < 下限=50` 会在喂帧之前就拒绝。
+   D435i 的暗光红外素材本来就低对比（本机实测 `levels_median=54`、`lap_median=1.9`、`mean_grey=21.5`），
+   所以默认下限基本必拒。用 `UNAV_VIO_MH01_IMAGE_LAP_MIN=1`（必要时配 `UNAV_VIO_MH01_IMAGE_LEVELS_MIN`）
+   放宽——这是**观察侧旋钮**，放宽它不等于素材适合做 VIO。
+2. **相机时间偏移**：较新的回放会从 `sensor.yaml` 读 `timeshift_to_imu_ms`（结论行印
+   `td_effective_ms=6 td_source=dataset_sensor_yaml`）。本仓库的录制端**不写这个键**，所以它只可能来自
+   事后手改的数据集；一旦写上且数值不对，症状是 `未及时初始化`、`states=0`，而画面和 landmark 照常落盘，
+   很容易误判成"回放坏了"。用 `UNAV_VIO_MH01_TD_MS=0` 覆盖即可验证（本机 A/B：td=6 → fail/states=0，
+   td=0 → pass/states=44/first_state_frame=107，与旧二进制一致）。
+   注意 `rh verify` 对这种未知顶层键是放行的，所以校验通过不代表这个值能用。
 
 Rerun 查看器不在 PATH 里，也不随本项目安装：它得是 **0.37.x**（`uav_nav_rerun 0.5.0` 传递依赖
 `rerun_sdk 0.37.1 EXACT`），本机用的是 `~/桌面/rerun-cli-0.37.1-x86_64-unknown-linux-gnu`。
@@ -236,8 +254,10 @@ python3 tools/rh_gui.py --smoke    # 构造界面 1.5 s 后自动关闭，验证
   完全一致（`UNAV_VIO_MH01_REQUIRE_GT`、`MAX_FRAMES`、`UNAV_VIO_RERUN_SAVE`、
   `UNAV_VIO_REPLAY_ARTIFACT_DIR`、`UNAV_VIO_RERUN_IMAGES`）；产物目录非空时先自己拒绝，
   而不是等子进程报"拒绝覆盖"。
-  「把双目画面写进 .rrd」默认**勾上**（界面是给人看东西的），日志会先按 0.28 MB/帧估一次体积并
+  「把双目画面写进 .rrd」默认**勾上**（界面是给人看东西的），日志会先按 0.55 MB/帧估一次体积并
   对比目标盘余量；取消勾选就回到上游 SAVE 的默认行为，只有轨迹和点云。
+  「回放侧覆盖」三个小格对应上面那两道门和 `UNAV_VIO_MH01_TD_MS`，**留空就是不覆盖**；填了非数字
+  会在日志里说明"这次按上游默认值"，而不是把坏值塞给子进程。
   三个路径框都带「浏览…」按钮，其中「输出 .rrd」用的是**另存为**对话框——那个文件通常还没
   生成，拿目录选择器会逼你先手工建一个文件。
   「打开 Rerun viewer」先找 PATH 里的 `rerun`，找不到再找 `~/桌面/rerun-cli-*`。它是另开一个

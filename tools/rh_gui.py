@@ -98,13 +98,16 @@ def build_verify_command(rh: Path, dataset: Path, no_gt_required: bool, deep: bo
     return argv
 
 
-# 实测（d435i_20260924_164630，MAX_FRAMES=20 → .rrd 5,500,731 B）：画面是渲染成 RGB8 的叠加图，
-# 不是原始 PNG，所以每帧对约 0.28 MB；开整段 5400 帧就要 1.5 GB 量级，值得提前告诉用户。
-RRD_IMAGE_BYTES_PER_FRAME = 2.75e5
+# 实测（d435i_20260924_164630，MAX_FRAMES=300 → .rrd 165,225,452 B，image_records=600）：画面是
+# 叠加特征后渲染成 RGB8 的图，不是原始 PNG，所以每帧对约 0.55 MB；整段 5400 帧就是 3 GB 量级。
+# 没画标记的旧二进制是 0.31 MB/帧对，别拿那个数当预期。
+RRD_IMAGE_BYTES_PER_FRAME = 5.5e5
 
 
 def replay_env(dataset: Path, max_frames: int, require_gt: bool, rrd: Path | None,
-               artifacts: Path | None, rerun_images: bool = False) -> dict[str, str]:
+               artifacts: Path | None, rerun_images: bool = False,
+               image_levels_min: str = "", image_lap_min: str = "",
+               td_ms: str = "") -> dict[str, str]:
     env = {
         "UNAV_VIO_EUROC_MH01": str(dataset),
         "UNAV_VIO_MH01_MAX_FRAMES": str(max_frames),
@@ -118,6 +121,13 @@ def replay_env(dataset: Path, max_frames: int, require_gt: bool, rrd: Path | Non
             env["UNAV_VIO_RERUN_IMAGES"] = "1"
     if artifacts is not None:
         env["UNAV_VIO_REPLAY_ARTIFACT_DIR"] = str(artifacts)
+    # 留空 = 用上游默认；填了才覆盖。这几个都是回放侧旋钮，不是录制端契约。
+    # 注意 "0" 是有效覆盖（把数据集里写的相机时间偏移清零），所以判据是"非空"而非"非零"。
+    for key, value in (("UNAV_VIO_MH01_IMAGE_LEVELS_MIN", image_levels_min),
+                       ("UNAV_VIO_MH01_IMAGE_LAP_MIN", image_lap_min),
+                       ("UNAV_VIO_MH01_TD_MS", td_ms)):
+        if value:
+            env[key] = value
     return env
 
 
@@ -401,6 +411,9 @@ class App:
             "max_frames": tk.StringVar(value="300"),
             "rrd": tk.StringVar(value="/tmp/rh_gui.rrd"),
             "artifacts": tk.StringVar(value="/tmp/rh_gui-artifacts"),
+            # 上游回放侧旋钮，留空就用它自带的默认值。
+            "image_levels": tk.StringVar(value=""), "image_lap": tk.StringVar(value=""),
+            "td_ms": tk.StringVar(value=""),
         }
         self.require_gt = tk.BooleanVar(value=False)
         self.rerun_images = tk.BooleanVar(value=True)
@@ -417,12 +430,24 @@ class App:
                 ttk.Button(frame, text="浏览…", width=7,
                            command=lambda k=key, s=style: self.pick_replay_path(k, s)).grid(
                     row=row, column=2, sticky="w", padx=(6, 0))
+        overrides = ttk.Frame(frame)
+        overrides.grid(row=len(labels), column=1, columnspan=2, sticky="w")
+        ttk.Label(frame, text="回放侧覆盖（空=默认）").grid(row=len(labels), column=0,
+                                                     sticky="e", padx=6, pady=2)
+        for key, caption in (("image_levels", "levels 下限"), ("image_lap", "lap 下限"),
+                             ("td_ms", "td ms")):
+            ttk.Label(overrides, text=caption).pack(side="left")
+            ttk.Entry(overrides, textvariable=self.replay_fields[key], width=5).pack(
+                side="left", padx=(2, 8))
+        ttk.Label(overrides, text="D435i 暗光红外的 lap 中位数实测 ~1.9，默认 50 会拒；"
+                                  "sensor.yaml 里的 timeshift 让初始化失败时填 0")\
+            .pack(side="left", padx=6)
         ttk.Checkbutton(frame, text="要求 GT（本机没有位姿流，默认关）",
-                        variable=self.require_gt).grid(row=len(labels), column=1, sticky="w")
-        ttk.Checkbutton(frame, text="把双目画面写进 .rrd（约 0.3 MB/帧）",
-                        variable=self.rerun_images).grid(row=len(labels), column=2, sticky="w")
+                        variable=self.require_gt).grid(row=len(labels) + 1, column=1, sticky="w")
+        ttk.Checkbutton(frame, text="把双目画面写进 .rrd（约 0.55 MB/帧）",
+                        variable=self.rerun_images).grid(row=len(labels) + 1, column=2, sticky="w")
         buttons = ttk.Frame(frame)
-        buttons.grid(row=len(labels) + 1, column=1, columnspan=2, sticky="w", pady=4)
+        buttons.grid(row=len(labels) + 2, column=1, columnspan=2, sticky="w", pady=4)
         self.replay_button = ttk.Button(buttons, text="回放选中数据集", command=self.run_replay)
         self.replay_button.pack(side="left", padx=4)
         ttk.Button(buttons, text="打开 Rerun viewer", command=self.open_viewer).pack(side="left", padx=4)
@@ -513,6 +538,18 @@ class App:
         self.spawn(build_verify_command(self.rh, dataset, self.verify_no_gt.get(),
                                        self.verify_deep.get()))
 
+    def numeric_field(self, key: str, label: str) -> str:
+        """喂给上游的浮点旋钮：非数字会被子进程静默忽略，所以在这里挡掉并说明。"""
+        raw = self.replay_fields[key].get().strip()
+        if not raw:
+            return ""
+        try:
+            float(raw)
+        except ValueError:
+            self.log(f"[提示] {label}「{raw}」不是数字，这次按上游默认值")
+            return ""
+        return raw
+
     def run_replay(self) -> None:
         dataset = self.selected_dataset()
         if dataset is None:
@@ -555,8 +592,11 @@ class App:
                  f"require_gt={'1' if self.require_gt.get() else '0'}，"
                  f"{'.rrd → ' + str(rrd) if rrd else '不存 .rrd（字段留空了）'}，{picture}"
                  f"（Debug 下 300 帧约 5 分钟）")
-        self.spawn([str(binary)], replay_env(dataset, frames, self.require_gt.get(),
-                                             rrd, artifacts, self.rerun_images.get()))
+        self.spawn([str(binary)], replay_env(
+            dataset, frames, self.require_gt.get(), rrd, artifacts, self.rerun_images.get(),
+            self.numeric_field("image_levels", "levels 下限"),
+            self.numeric_field("image_lap", "lap 下限"),
+            self.numeric_field("td_ms", "相机时间偏移")))
         # 启动失败时 spawn 只留一行日志、self.process 仍为 None：这时别把按钮锁死。
         if self.process is not None:
             self.replay_button.configure(state="disabled")
@@ -629,6 +669,15 @@ def selftest(root_dir: Path) -> int:
           "勾了画面就设 UNAV_VIO_RERUN_IMAGES=1")
     check("UNAV_VIO_RERUN_IMAGES" not in replay_env(Path("/d"), 300, False, None, None, True),
           "没有 .rrd 就没有落图的地方，不该设这个变量")
+    # 图像质量下限是上游回放前置门的旋钮：留空必须真的什么都不设，让默认值生效。
+    check(replay_env(Path("/d"), 300, False, None, None, False, "", "1")["UNAV_VIO_MH01_IMAGE_LAP_MIN"]
+          == "1", "lap 下限填了才透传")
+    check("UNAV_VIO_MH01_IMAGE_LEVELS_MIN" not in replay_env(Path("/d"), 300, False, None, None),
+          "下限留空时交给上游默认，不设空字符串")
+    check(replay_env(Path("/d"), 300, False, None, None, td_ms="0")["UNAV_VIO_MH01_TD_MS"] == "0",
+          "td 覆盖成 0 也要传（数据集里写了 timeshift 时这是唯一清零办法）")
+    check("UNAV_VIO_MH01_TD_MS" not in replay_env(Path("/d"), 300, False, None, None),
+          "td 留空时不覆盖，交给数据集的 sensor.yaml")
 
     check(record_problems(cfg, Path("/")) == [], "合法参数不该报警")
     bad = dict(cfg, seq="has space", still="1", excite="1", tail="0", duration="10")
