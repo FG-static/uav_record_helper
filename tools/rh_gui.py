@@ -98,10 +98,10 @@ def build_verify_command(rh: Path, dataset: Path, no_gt_required: bool, deep: bo
     return argv
 
 
-# 实测（d435i_20260924_164630，MAX_FRAMES=300 → .rrd 165,225,452 B，image_records=600）：画面是
-# 叠加特征后渲染成 RGB8 的图，不是原始 PNG，所以每帧对约 0.55 MB；整段 5400 帧就是 3 GB 量级。
+# 实测（d435i_20260924_164630，MAX_FRAMES=300 → .rrd 167,711,289 B，image_records=600）：画面是
+# 叠加特征后渲染成 RGB8 的图，不是原始 PNG，所以每帧对约 0.56 MB；整段 5400 帧就是 3 GB 量级。
 # 没画标记的旧二进制是 0.31 MB/帧对，别拿那个数当预期。
-RRD_IMAGE_BYTES_PER_FRAME = 5.5e5
+RRD_IMAGE_BYTES_PER_FRAME = 5.6e5
 
 
 def replay_env(dataset: Path, max_frames: int, require_gt: bool, rrd: Path | None,
@@ -444,7 +444,7 @@ class App:
             .pack(side="left", padx=6)
         ttk.Checkbutton(frame, text="要求 GT（本机没有位姿流，默认关）",
                         variable=self.require_gt).grid(row=len(labels) + 1, column=1, sticky="w")
-        ttk.Checkbutton(frame, text="把双目画面写进 .rrd（约 0.55 MB/帧）",
+        ttk.Checkbutton(frame, text="把双目画面写进 .rrd（约 0.56 MB/帧）",
                         variable=self.rerun_images).grid(row=len(labels) + 1, column=2, sticky="w")
         buttons = ttk.Frame(frame)
         buttons.grid(row=len(labels) + 2, column=1, columnspan=2, sticky="w", pady=4)
