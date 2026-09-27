@@ -159,10 +159,13 @@ RSUSB 后端 + 内核 hid-sensor/IIO）。换机器、换构建都要重看这�
 指到已安装的 SDK；Ceres 要 2.2.0）：
 
 ```bash
-cd <ace_unav>/modules/unav_vio
+cd <unav_vio>
 cmake -S . -B build-replay -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH=<uav_nav 的 sdk-install>
-cmake --build build-replay --target vio_mh01_replay_test --parallel
+cmake --build build-replay --target vio_mh01_replay --parallel
 ```
+
+新构建的可执行文件叫 `vio_mh01_replay`；旧目录里可能仍是 `vio_mh01_replay_test`。JSONL 在线播放还要
+`vio_observation_playback`（只在找到 `uav_nav_rerun` 时才会编进来）。
 
 然后指着我们录的目录跑：
 
@@ -198,7 +201,7 @@ env UNAV_VIO_EUROC_MH01=~/datasets/room_03 UNAV_VIO_MH01_MAX_FRAMES=300 \
     UNAV_VIO_MH01_REQUIRE_GT=0 \
     UNAV_VIO_RERUN_SAVE=/tmp/room_03.rrd UNAV_VIO_REPLAY_ARTIFACT_DIR=/tmp/room_03-artifacts \
     UNAV_VIO_RERUN_IMAGES=1 \
-    ./build-replay/vio_mh01_replay_test
+    ./build-replay/vio_mh01_replay
 <rerun 可执行> /tmp/room_03.rrd      # 或加 --serve-web 后用浏览器打开它打印的地址
 ```
 
@@ -211,20 +214,33 @@ env UNAV_VIO_EUROC_MH01=~/datasets/room_03 UNAV_VIO_MH01_MAX_FRAMES=300 \
 灰度图每个像素满足 R=G=B，抓一张截图统计通道偏离即可（标记色是绿 (40,255,40)、洋红 (255,0,255)、
 黄 (255,220,0)，偏离都是满量程级）。早期帧里洋红（新检测）占多数，收敛之后才是绿点加位移箭头。
 
-### 换到较新的 unav_vio 后回放会多出的两道门
+### 换到较新的 unav_vio 后回放会多出的几道旋钮
 
-这两道门都在回放测试里，录制端管不着，但会直接让"昨天还能跑"的数据集今天跑不动：
+这些都在回放测试里，录制端管不着，但会直接让「昨天还能跑」的数据集今天跑不动：
 
 1. **图像质量前置门**：`image_quality=fail ... 拉普拉斯方差中位数=1.9 < 下限=50` 会在喂帧之前就拒绝。
    D435i 的暗光红外素材本来就低对比（本机实测 `levels_median=54`、`lap_median=1.9`、`mean_grey=21.5`），
    所以默认下限基本必拒。用 `UNAV_VIO_MH01_IMAGE_LAP_MIN=1`（必要时配 `UNAV_VIO_MH01_IMAGE_LEVELS_MIN`）
    放宽——这是**观察侧旋钮**，放宽它不等于素材适合做 VIO。
-2. **相机时间偏移**：较新的回放会从 `sensor.yaml` 读 `timeshift_to_imu_ms`（结论行印
+2. **初始化等待预算**：上游默认 `max_bootstrap_frames=150`（EuRoC 20 Hz 约 7.5 s）。D435i 30 Hz
+   还要先攒 0.5 s 静止，`d435i_20260924_164630` 的 Gate 1 留档 `first_state_frame=230`。不设
+   `UNAV_VIO_MH01_BOOTSTRAP_FRAMES` 会在 150 帧处放弃，随后 `未及时初始化` / `states=0` /
+   双目 ingress `status=5`（ComponentFailed）。这只加长「还允许再等多久」，不改任何判据。
+   同一次成功留档还开了 `UNAV_VIO_MH01_FRONTEND_CONTRAST=1`，短窗 W1 用
+   `UNAV_VIO_MH01_IMAGE_LEVELS_MIN=25`（出厂 32 不变）。
+3. **相机时间偏移**：较新的回放会从 `sensor.yaml` 读 `timeshift_to_imu_ms`（结论行印
    `td_effective_ms=6 td_source=dataset_sensor_yaml`）。本仓库的录制端**不写这个键**，所以它只可能来自
-   事后手改的数据集；一旦写上且数值不对，症状是 `未及时初始化`、`states=0`，而画面和 landmark 照常落盘，
-   很容易误判成"回放坏了"。用 `UNAV_VIO_MH01_TD_MS=0` 覆盖即可验证（本机 A/B：td=6 → fail/states=0，
-   td=0 → pass/states=44/first_state_frame=107，与旧二进制一致）。
-   注意 `rh verify` 对这种未知顶层键是放行的，所以校验通过不代表这个值能用。
+   事后手改的数据集（2026-09-24 22:34 `estimate_td.py` 把实测 +6 ms 回写进了 `d435i_20260924_164630`）。
+   同一份录制在 2026-09-26 用同一二进制做过全矩阵 A/B：td=6 时无论怎么配，全程回放都会中途
+   NumericalFailure 停机——默认 bootstrap 下初始化被拖出预算（~200 帧处死、`states=0`），
+   加长 `BOOTSTRAP_FRAMES` 后会在 461 帧处被健康门（连续 5 帧不健康）停机（300 帧短窗恰好
+   死在窗口之前，所以 `states=71`/`states=219` 的短窗"通过"只说明还没跑到死点）；
+   `UNAV_VIO_MH01_TD_MS=0`（或删掉 sensor.yaml 里那行键）后，配合 `FRONTEND_CONTRAST=1`
+   与加长 bootstrap 能整段跑完（`first_state_frame=107`、5160 个状态连续发布到 5266 帧，
+   与 Gate 1 全程留档一致）。症状上这表现为「回放播了几百帧之后轨迹/landmark/特征标记
+   全部消失而画面照常」，极易误判成回放坏了。
+   `rh verify` 现在会盯住这个键：录制产物（带 `record_summary.yaml`）里手写非零值判 FAIL，
+   外来数据集给 WARN（`"0"` 必须显式传，空字符串表示不覆盖——对缺键数据集两者等价）。
 
 Rerun 查看器不在 PATH 里，也不随本项目安装：它得是 **0.37.x**（`uav_nav_rerun 0.5.0` 传递依赖
 `rerun_sdk 0.37.1 EXACT`），本机用的是 `~/桌面/rerun-cli-0.37.1-x86_64-unknown-linux-gnu`。
@@ -233,6 +249,62 @@ Rerun 查看器不在 PATH 里，也不随本项目安装：它得是 **0.37.x**
 live 推流（边跑边看）与 SAVE 互斥：先 `rerun --serve-web --bind 127.0.0.1 --port 9876`，
 再用 `--connect` 跑，并且**不要**同时给 `UNAV_VIO_RERUN_SAVE`——回放侧的连接端点是写死的
 `rerun+http://127.0.0.1:9876/proxy`。
+
+### JSONL 在线播放（省内存）
+
+整段带画面的 `.rrd` 会按时长涨到数 GB，Rerun 打开时还要把历史常驻在 Viewer 里。较新的 unav_vio
+把观看拆成两步：回放时只写一份**不复制 PNG** 的观察留档（JSONL），再由 `vio_observation_playback`
+按源曝光时间读 JSONL + 原始 `cam0`/`cam1` PNG，live 推给 Viewer。它不重跑 VIO，CLI 也不提供
+SAVE。全段观察留档大约是一百多 MB（本机 5426 帧约 146 MiB），不是第二份 5 GB `.rrd`。
+
+回放时设 `UNAV_VIO_OBSERVATION_ARCHIVE=<路径>.jsonl`；上游**拒绝覆盖**已有文件。可与
+`UNAV_VIO_RERUN_SAVE` 并存（观察者挂在同一条回调上），但在线播放本身不要再走 SAVE：
+
+```bash
+env UNAV_VIO_EUROC_MH01=~/datasets/d435i_20260924_164630 \
+    UNAV_VIO_MH01_MAX_FRAMES=300 \
+    UNAV_VIO_MH01_REQUIRE_GT=0 \
+    UNAV_VIO_MH01_BOOTSTRAP_FRAMES=300 \
+    UNAV_VIO_MH01_FRONTEND_CONTRAST=1 \
+    UNAV_VIO_MH01_IMAGE_LEVELS_MIN=25 \
+    UNAV_VIO_MH01_IMAGE_LAP_MIN=1 \
+    UNAV_VIO_OBSERVATION_ARCHIVE=/tmp/room_03-observation.jsonl \
+    UNAV_VIO_REQUIRE_OBSERVATION_ARCHIVE=1 \
+    ./build-rerun060-release/vio_euroc_replay
+```
+
+`observation_archive=pass` 和 `vio_result=pass` 是两件事：全段这份数据上 VIO 仍可能
+`fail`（失锁），留档照样能播。上游拒绝覆盖已有 JSONL，坏档要先删再生成。
+
+先起 live Viewer（`--memory-limit` 是 Viewer 保护，不能代替抽帧），再播。`--display-hz 5`
+按墙钟抽 RGB（默认 `0` = 每帧都发，与源 30 Hz 对齐）；State / landmark 仍每帧推，不会因为
+抽帧丢掉数值。观看路径不要加 `--repeat-shifted`（那是内存验收加倍样本用的）：
+
+```bash
+<rerun 可执行> --serve-web --bind 127.0.0.1 --port 9876 --memory-limit 4GB
+./build-replay/vio_observation_playback \
+    --archive /tmp/room_03-observation.jsonl \
+    --dataset ~/datasets/room_03 \
+    --connect --display-hz 5
+```
+
+`--dataset` 可省略，播放器会用留档头里的 `dataset_path`。没 Viewer 时 `--connect` 只记
+`viewer=fail`、退出码仍为 0；要硬失败再加 `--require-viewer`。
+
+### 把留档画成轨迹图
+
+回放的 `artifacts/` 里有一份 `estimated.tum`（无 GT 时的估计轨迹）。出图用它，不再需要一次性脚本：
+
+```bash
+python3 tools/rh_report.py /tmp/room_03-artifacts        # 写 <产物目录>/../trajectory.png
+python3 tools/rh_report.py <目录> --output /tmp/t.png --title "room_03"
+python3 tools/rh_report.py --selftest                    # 合成方环自检，不需要 DISPLAY
+```
+
+左图是 XY 平面（首末状态各标一个点），右图是 XYZ 随时间；标题里给 `states / 时长 / XYZ 跨度 /
+path（累计路径长）/ endpoint（首末距离）`。**path 和 endpoint 是两码事**：闭环判据看后者除以前者
+（run_02 是 5.04 m / 155.9 m = 3.2%）。看形状、闭环、跳变可以，判断精度不行——没有 GT。它**拒绝
+覆盖**已有图。依赖 numpy/matplotlib（本机 python3 自带 matplotlib 3.6.3），缺了会直接说装什么。
 
 ## 图形界面（可选）
 
@@ -252,17 +324,41 @@ python3 tools/rh_gui.py --smoke    # 构造界面 1.5 s 后自动关闭，验证
   终端决定何时停"这个前提失效，所以这里刻意不做内嵌伪终端。
 - **数据集**：列 `<输出目录>/*/mav0`，标出大小与缺不缺 GT/深度；选中后跑 `rh verify`，
   刷新列表会保留你的选中项。
-- **回放**：直接调 unav_vio 构建目录里的 `vio_mh01_replay_test`，环境变量与上面「回放」小节
-  完全一致（`UNAV_VIO_MH01_REQUIRE_GT`、`MAX_FRAMES`、`UNAV_VIO_RERUN_SAVE`、
-  `UNAV_VIO_REPLAY_ARTIFACT_DIR`、`UNAV_VIO_RERUN_IMAGES`）；产物目录非空时先自己拒绝，
+- **回放**：直接调 unav_vio 构建目录里的 `vio_mh01_replay`（找不到再试旧名 `vio_mh01_replay_test`），
+  环境变量与上面「回放」小节完全一致（`UNAV_VIO_MH01_REQUIRE_GT`、`MAX_FRAMES`、
+  `UNAV_VIO_MH01_BOOTSTRAP_FRAMES`、`UNAV_VIO_MH01_FRONTEND_CONTRAST`、
+  `UNAV_VIO_RERUN_SAVE`、`UNAV_VIO_REPLAY_ARTIFACT_DIR`、`UNAV_VIO_RERUN_IMAGES`、
+  `UNAV_VIO_OBSERVATION_ARCHIVE`、`UNAV_VIO_REQUIRE_OBSERVATION_ARCHIVE`）。默认构建目录优先选本机带 JSONL 播放器的
+  `~/unav_vio/build-rerun060-release`。产物目录非空、JSONL 已存在时先自己拒绝，
   而不是等子进程报"拒绝覆盖"。
   「把双目画面写进 .rrd」默认**勾上**（界面是给人看东西的），日志会先按 0.56 MB/帧估一次体积并
   对比目标盘余量；取消勾选就回到上游 SAVE 的默认行为，只有轨迹和点云。
-  「回放侧覆盖」三个小格对应上面那两道门和 `UNAV_VIO_MH01_TD_MS`，**留空就是不覆盖**；填了非数字
-  会在日志里说明"这次按上游默认值"，而不是把坏值塞给子进程。
-  三个路径框都带「浏览…」按钮，其中「输出 .rrd」用的是**另存为**对话框——那个文件通常还没
+  「前端对比度归一化」默认勾上（与 Gate 1 成功 JSONL 同口径）；bootstrap 按
+  `max(MAX_FRAMES, 240)` 自动设，整段（0）用 8192。
+  「回放写 .rrd」走 SAVE；「生成 JSONL」另有一颗按钮，同样跑一遍 VIO，但只设
+  `UNAV_VIO_OBSERVATION_ARCHIVE`、不写 `.rrd`。JSONL 路径默认 `/tmp/rh_gui-observation.jsonl`；
+  上游拒绝覆盖，已有文件时「生成 JSONL」会拦下，「回放写 .rrd」则跳过观察留档只写 `.rrd`。
+  日志出现 `observation_archive=pass` 即认为 JSONL 写完，即使退出码非 0（那只说明
+  `vio_result=` 没过）。写出后再点「JSONL 在线播放」调 `vio_observation_playback --archive … --connect`；
+  「display-hz」留空则不传该开关（CLI 默认 0=每帧都发；填 `5` 才抽帧）。
+  在线播之前先点「打开 live Viewer」（`--serve-web` 监听 `127.0.0.1:9876`，带
+  `--memory-limit 4GB`）；「关闭 live Viewer」只杀本界面拉起的那一组进程，终端里自己开的
+  请在那边停。关窗口时也会顺手停掉它。
+  「回放侧覆盖」四个小格对应图像质量门、`UNAV_VIO_MH01_TD_MS` 和停滞预算 `UNAV_VIO_MH01_WAIT_MS`。
+  **lap 下限预填 1、levels 预填 25**（D435i 暗光红外过不了上游默认 50/32；短窗 Gate 1 的 W1
+  抽样 `levels_median=25`）。**td 留空**，用数据集 `sensor.yaml` 里的值；不要把「未及时初始化」
+  默认当成 timeshift 问题。**停滞 ms 留空**＝用上游默认 120000；只有 JSONL 留档写到一半被
+  `TimedOut` 时才需要抬（留档每行 flush、跑在 Component 唯一的后台任务里，盘慢会节流消费）。
+  三个开关另外单独列：`要求 GT`、`前端对比度归一化`（暗光红外建议开）、
+  **`只准静止段起步`**（= `UNAV_VIO_MH01_ALLOW_MOTION_START=0`；允许运动段起步时初始化会在
+  剧烈晃动的那一帧锁锚，run_01 曾因此在 0.9 s 内撞上 `max_speed` 健康门）。
+  填了非数字会在日志里说明
+  "这次按上游默认值"，而不是把坏值塞给子进程。
+  路径框都带「浏览…」按钮，其中「输出 .rrd」和 JSONL 用的是**另存为**对话框——那个文件通常还没
   生成，拿目录选择器会逼你先手工建一个文件。
-  「打开 Rerun viewer」先找 PATH 里的 `rerun`，找不到再找 `~/桌面/rerun-cli-*`。它是另开一个
+  「出 trajectory.png」调 `tools/rh_report.py`（见上一节），产物目录里没有 `estimated.tum` 时
+  只提示、不空点。
+  「打开 .rrd」先找 PATH 里的 `rerun`，找不到再找 `~/桌面/rerun-cli-*`。它是另开一个
   进程去**读**那个 `.rrd`，所以点它不会打断回放；真正的问题是时机——`.rrd` 的 footer 只在写入方
   关闭文件时才写上，回放途中打开只会得到 `Missing RRD footer / no RRD manifests`。因此日志出现
   「.rrd 已写完并关闭」之前，界面会拦下这一击。
@@ -307,9 +403,11 @@ python3 tools/rh_gui.py --smoke    # 构造界面 1.5 s 后自动关闭，验证
   （±3 % 上下）。两条都在 `verify` 的 0.5 m/s² 容差内，但静止初始化的零速假设会吃掉这部分余量；
   这是器件误差，不是录制端能修的，只在这里留个记录。
 - D400 的红外是全局快门、电子快门；`--exposure-us` 用来压运动模糊。
-- `camera_time_offset_to_imu` 与 `calibration.version` 在 unav_vio 回放侧是硬编码的
-  （0 ns / 1），无法通过数据集文件表达；D435i 的 IMU 与图像同用一个设备时钟域，
-  所以录出来的共享曝光时间戳是自洽的，但**不要**拿这份数据去测非零时移的行为。
+- `calibration.version` 在 unav_vio 回放侧仍是硬编码常量（1）。`camera_time_offset_to_imu`
+  原先也硬编码 0 ns，较新的回放改为从 `cam0/sensor.yaml` 的 `timeshift_to_imu_ms` 读取
+  （缺键按 0）；录制端依旧不写这个键——D435i 的 IMU 与图像同用一个设备时钟域，共享曝光
+  时间戳下 0 是自洽的，而实测非零 td 会让全程回放在中段停机（见「回放」一节的相机时间
+  偏移），`rh verify` 会把手写该键的录制产物拦下。
 - 单测不需要设备即可跑：合成数据走的是与真实录制完全相同的 writer/verify 代码路径。
   设备侧只有 `capture.cpp` 一个文件依赖 librealsense。
 

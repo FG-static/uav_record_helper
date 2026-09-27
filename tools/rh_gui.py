@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RecordHelper 的驱动界面：探测 → 录制 → 校验 → 回放（含 .rrd）。
+"""RecordHelper 的驱动界面：探测 → 录制 → 校验 → 回放（.rrd 全量 / JSONL 在线）。
 
 它不链接任何图形库，也不给 C++ 库引入新依赖：界面里每个动作都是在调用已经构建好的命令行
 程序，参数与环境变量和 README 里手敲的那几条完全一致。录制本身仍然开在**真实终端窗口**里
@@ -18,6 +18,7 @@ import os
 import queue
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -54,11 +55,34 @@ def find_rh(root: Path) -> Path | None:
     return None
 
 
+def _executable(path: Path) -> Path | None:
+    return path if path.is_file() and os.access(path, os.X_OK) else None
+
+
 def find_replay_binary(build_dir: Path) -> Path | None:
-    candidate = build_dir / "vio_mh01_replay_test"
-    if candidate.is_file() and os.access(candidate, os.X_OK):
-        return candidate
+    """新 unav_vio 把可执行文件改名为 vio_mh01_replay；旧构建目录仍是 *_test。"""
+    for name in ("vio_mh01_replay", "vio_mh01_replay_test"):
+        if found := _executable(build_dir / name):
+            return found
     return None
+
+
+def find_playback_binary(build_dir: Path) -> Path | None:
+    return _executable(build_dir / "vio_observation_playback")
+
+
+def default_unav_build() -> Path:
+    """优先选带 JSONL 播放器的构建目录，没有再退回 GUI 原先默认的 ace_unav 路径。"""
+    home = Path.home()
+    candidates = (
+        home / "unav_vio" / "build-rerun060-release",
+        home / "unav_vio" / "build-replay",
+        home / "ace_unav" / "modules" / "unav_vio" / "build-replay",
+    )
+    for path in candidates:
+        if find_replay_binary(path) is not None:
+            return path
+    return candidates[-1]
 
 
 def rerun_viewer() -> Path | None:
@@ -104,15 +128,54 @@ def build_verify_command(rh: Path, dataset: Path, no_gt_required: bool, deep: bo
 RRD_IMAGE_BYTES_PER_FRAME = 5.6e5
 
 
+def read_timeshift_ms(dataset: Path) -> float | None:
+    """读 mav0/cam0/sensor.yaml 的 timeshift_to_imu_ms；缺键、读不了或值坏都返回 None。
+
+    录制端从不写这个键（D435i 图像与 IMU 同一时钟域，共享曝光时间戳下 td=0 自洽），
+    所以非 None 就意味着数据集被事后改过（例如 estimate_td.py 实测后回写）。
+    实测（2026-09-26，同一二进制 A/B）非零 td 会让全程回放在中段停机：轨迹/landmark/
+    特征标记从那一刻全部消失而画面照常；td 框填 0（或删掉那行键）即恢复整段回放。
+    """
+    path = dataset / "mav0" / "cam0" / "sensor.yaml"
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            stripped = line.split("#", 1)[0].strip()
+            if stripped.startswith("timeshift_to_imu_ms:"):
+                return float(stripped.split(":", 1)[1].strip())
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def default_bootstrap_frames(max_frames: int) -> int:
+    """只加长「初始化还允许再等多久」，不改任何判据。
+
+    上游默认 150 帧（EuRoC 20 Hz 约 7.5 s）。D435i 30 Hz 还要先攒 0.5 s 静止，
+    `d435i_20260924_164630` 的 Gate 1 留档 first_state_frame=230，150 帧预算会
+    `未及时初始化` / `states=0`，随后双目 ingress `status=5`（ComponentFailed）。
+    整段（max_frames=0）给一个够用的上限；短窗至少放到 240（上游「及时」判据）。
+    """
+    if max_frames <= 0:
+        return 8192
+    return max(int(max_frames), 240)
+
+
 def replay_env(dataset: Path, max_frames: int, require_gt: bool, rrd: Path | None,
                artifacts: Path | None, rerun_images: bool = False,
                image_levels_min: str = "", image_lap_min: str = "",
-               td_ms: str = "") -> dict[str, str]:
+               td_ms: str = "", observation_archive: Path | None = None,
+               frontend_contrast: bool = False,
+               bootstrap_frames: int | None = None,
+               allow_motion_start: bool | None = None,
+               wait_ms: str = "") -> dict[str, str]:
     env = {
         "UNAV_VIO_EUROC_MH01": str(dataset),
         "UNAV_VIO_MH01_MAX_FRAMES": str(max_frames),
         # 结论行会印 require_gt=0/1：降级跑过必须能被事后区分，所以永远显式设。
         "UNAV_VIO_MH01_REQUIRE_GT": "1" if require_gt else "0",
+        "UNAV_VIO_MH01_BOOTSTRAP_FRAMES": str(
+            default_bootstrap_frames(max_frames) if bootstrap_frames is None
+            else bootstrap_frames),
     }
     if rrd is not None:
         env["UNAV_VIO_RERUN_SAVE"] = str(rrd)
@@ -121,6 +184,23 @@ def replay_env(dataset: Path, max_frames: int, require_gt: bool, rrd: Path | Non
             env["UNAV_VIO_RERUN_IMAGES"] = "1"
     if artifacts is not None:
         env["UNAV_VIO_REPLAY_ARTIFACT_DIR"] = str(artifacts)
+    # JSONL 观察留档：不复制 PNG，给 vio_observation_playback 按源时间在线播。上游拒绝覆盖。
+    if observation_archive is not None:
+        env["UNAV_VIO_OBSERVATION_ARCHIVE"] = str(observation_archive)
+        # 观察失败单独进退出码，不把 VIO 结论改写成 pass。
+        env["UNAV_VIO_REQUIRE_OBSERVATION_ARCHIVE"] = "1"
+    if frontend_contrast:
+        # Gate 1 同数据集成功留档开了对比度归一化；默认关会让暗光红外更难攒视差。
+        env["UNAV_VIO_MH01_FRONTEND_CONTRAST"] = "1"
+    if allow_motion_start is False:
+        # 只准在静止段起步。允许运动段起步时，初始化会在"这一批不安静"的当前帧锁锚，
+        # 没有静止窗可平均：run_01 曾在 imu_excitation=105.6 的猛晃里起步，首个发布态的
+        # |b_a| 就到 1.52 m/s²，0.9 s 内速度冲到 7.7 m/s 撞 max_speed 健康门。
+        env["UNAV_VIO_MH01_ALLOW_MOTION_START"] = "0"
+    if wait_ms:
+        # 停滞预算（ms，上游默认 120000）：只统计"已消费帧数不变"的时长，不是总运行时间。
+        # JSONL 留档每行都 flush 且跑在 Component 唯一的后台任务里，盘慢会直接节流消费。
+        env["UNAV_VIO_MH01_WAIT_MS"] = wait_ms
     # 留空 = 用上游默认；填了才覆盖。这几个都是回放侧旋钮，不是录制端契约。
     # 注意 "0" 是有效覆盖（把数据集里写的相机时间偏移清零），所以判据是"非空"而非"非零"。
     for key, value in (("UNAV_VIO_MH01_IMAGE_LEVELS_MIN", image_levels_min),
@@ -129,6 +209,62 @@ def replay_env(dataset: Path, max_frames: int, require_gt: bool, rrd: Path | Non
         if value:
             env[key] = value
     return env
+
+
+def build_report_command(root_dir: Path, artifacts: Path) -> list[str]:
+    """出图走 tools/rh_report.py：它只读 artifacts/estimated.tum，不接受重复运行覆盖旧图。"""
+    return [sys.executable, str(root_dir / "tools" / "rh_report.py"), str(artifacts)]
+
+
+def build_playback_command(binary: Path, archive: Path, dataset: Path | None,
+                           display_hz: str, rate: str = "1.0") -> list[str]:
+    """拼 vio_observation_playback：读 JSONL + 原始 PNG，不重跑 VIO。
+
+    display_hz 空或省略 = 每帧都发（CLI 默认 0）；>0 按墙钟抽 RGB，省 Viewer 内存。
+    """
+    argv = [str(binary), "--archive", str(archive), "--connect"]
+    if dataset is not None:
+        argv += ["--dataset", str(dataset)]
+    hz = display_hz.strip()
+    if hz:
+        argv += ["--display-hz", hz]
+    rate = rate.strip()
+    if rate and rate != "1.0":
+        argv += ["--rate", rate]
+    return argv
+
+
+def live_viewer_command(viewer: Path) -> list[str]:
+    """JSONL 在线播用的 live Viewer：端点写死 rerun+http://127.0.0.1:9876/proxy。"""
+    return [str(viewer), "--serve-web", "--bind", "127.0.0.1", "--port", "9876",
+            "--memory-limit", "4GB"]
+
+
+def kill_process_group(proc: subprocess.Popen) -> None:
+    """先 SIGTERM 整组，3 s 后再 SIGKILL。live Viewer 会再拉 web 子进程。"""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=3)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=2)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def terminal_launcher(argv: list[str], cwd: Path, keep_open: bool = True) -> list[str] | None:
@@ -251,10 +387,14 @@ class App:
         self.process: subprocess.Popen | None = None
         # 只有回放会往 .rrd 里写；探测/校验跑着的时候开 viewer 没有顾虑，所以单独记这一点。
         self.writing_rrd: Path | None = None
+        self.writing_jsonl: Path | None = None
+        self.reader_thread: threading.Thread | None = None
+        self.live_viewer: subprocess.Popen | None = None
 
         self.root = tk.Tk()
         self.root.title("RecordHelper")
-        self.root.geometry("1000x780")
+        self.root.geometry("1080x820")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_widgets()
         self.refresh_datasets()
         self.log(f"仓库根：{root_dir}")
@@ -279,26 +419,64 @@ class App:
         except queue.Empty:
             pass
         if self.process is not None and self.process.poll() is not None:
-            self.log(f"[退出码 {self.process.returncode}]")
+            code = self.process.returncode
+            reader = self.reader_thread
+            self.reader_thread = None
+            if reader is not None:
+                reader.join(timeout=1.0)
+            try:
+                while True:
+                    self.log(self.log_queue.get_nowait())
+            except queue.Empty:
+                pass
+            self.log(f"[退出码 {code}]")
             self.process = None
             if self.writing_rrd is not None:
                 self.log(f".rrd 已写完并关闭：{self.writing_rrd}（现在可以打开 viewer 了）")
                 self.writing_rrd = None
-            self.replay_button.configure(state="normal")
+            if self.writing_jsonl is not None:
+                jsonl = self.writing_jsonl
+                log_dump = self.log_text.get("1.0", "end")
+                archive_ok = "observation_archive=pass" in log_dump
+                if archive_ok:
+                    self.log(f"JSONL 已写完：{jsonl}（现在可以「JSONL 在线播放」）")
+                    if code != 0:
+                        self.log("[提示] 退出码非 0 只说明 VIO 验收没过（看 vio_result=），"
+                                 "观察留档成功不等于估计通过。")
+                else:
+                    hint = ("回放结束但没看到 observation_archive=pass"
+                            if code == 0 else
+                            "回放非 0 退出且没看到 observation_archive=pass")
+                    self.log(f"[提示] {hint}，检查 {jsonl} 是否完整"
+                             "（上游拒绝覆盖，坏档要先删再生成）")
+                self.writing_jsonl = None
+            self._set_replay_busy(False)
+        if self.live_viewer is not None and self.live_viewer.poll() is not None:
+            self.log(f"live Viewer 已退出（码 {self.live_viewer.returncode}）")
+            self.live_viewer = None
+            self._set_live_viewer_running(False)
         self.root.after(120, self._pump)
 
-    def spawn(self, argv: list[str], env_extra: dict[str, str] | None = None) -> None:
+    def spawn(self, argv: list[str], env_extra: dict[str, str] | None = None) -> bool:
+        if self.process is not None:
+            self.log("[提示] 还有子进程在跑，等日志出现退出码再点")
+            return False
         self.log("$ " + " ".join(shlex.quote(part) for part in argv))
         env = dict(os.environ)
         if env_extra:
             env.update(env_extra)
+            shown = " ".join(f"{key}={shlex.quote(value)}"
+                             for key, value in sorted(env_extra.items())
+                             if key.startswith("UNAV_VIO_"))
+            if shown:
+                self.log("  env " + shown)
         try:
             self.process = subprocess.Popen(
                 argv, cwd=str(self.root_dir), stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
         except OSError as error:
             self.log(f"[启动失败] {error}")
-            return
+            return False
         pipe = self.process.stdout
 
         def reader() -> None:
@@ -307,7 +485,27 @@ class App:
                 self.log_queue.put(line)
             pipe.close()
 
-        threading.Thread(target=reader, daemon=True).start()
+        self.reader_thread = threading.Thread(target=reader, daemon=True)
+        self.reader_thread.start()
+        return True
+
+    def _set_replay_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        for name in ("replay_button", "archive_button", "playback_button"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.configure(state=state)
+
+    def _set_live_viewer_running(self, running: bool) -> None:
+        if getattr(self, "live_open_button", None) is None:
+            return
+        self.live_open_button.configure(state="disabled" if running else "normal")
+        self.live_close_button.configure(state="normal" if running else "disabled")
+
+    def _on_close(self) -> None:
+        if os.environ.get("RH_GUI_SMOKE") != "1":
+            self.close_live_viewer(quiet=True)
+        self.root.destroy()
 
     def require_rh(self) -> bool:
         if self.rh is not None:
@@ -404,24 +602,36 @@ class App:
 
     def _replay_frame(self) -> None:
         tk, ttk = self.tk, self.ttk
-        frame = ttk.LabelFrame(self.root, text="回放（直接调 unav_vio 的 vio_mh01_replay_test）")
+        frame = ttk.LabelFrame(self.root, text="回放（unav_vio：.rrd 全量 / JSONL 在线）")
         frame.pack(fill="x", padx=10, pady=6)
         self.replay_fields = {
-            "build": tk.StringVar(value=str(Path.home() / "ace_unav" / "modules" / "unav_vio" / "build-replay")),
+            "build": tk.StringVar(value=str(default_unav_build())),
             "max_frames": tk.StringVar(value="300"),
             "rrd": tk.StringVar(value="/tmp/rh_gui.rrd"),
             "artifacts": tk.StringVar(value="/tmp/rh_gui-artifacts"),
-            # 上游回放侧旋钮，留空就用它自带的默认值。
-            "image_levels": tk.StringVar(value=""), "image_lap": tk.StringVar(value=""),
+            "jsonl": tk.StringVar(value="/tmp/rh_gui-observation.jsonl"),
+            "display_hz": tk.StringVar(value=""),
+            # 300 帧短窗 Gate 1 的 W1 抽样 levels_median=25，出厂下限 32 会拒。
+            "image_levels": tk.StringVar(value="25"),
+            # D435i 暗光红外 lap 中位数经常 <10，上游默认下限 50 会在喂帧前整段拒绝。
+            "image_lap": tk.StringVar(value="1"),
             "td_ms": tk.StringVar(value=""),
+            # 上游默认停滞预算 120000 ms；JSONL 每行 flush 会节流消费，盘慢时按需要抬。
+            "wait_ms": tk.StringVar(value=""),
         }
         self.require_gt = tk.BooleanVar(value=False)
         self.rerun_images = tk.BooleanVar(value=True)
-        # 最后一步是选法：dir 选已有目录，save 给还没写出来的 .rrd，None 是数字输入不给按钮。
+        # Gate 1 同数据集成功 JSONL 开了对比度归一化。
+        self.frontend_contrast = tk.BooleanVar(value=True)
+        # 允许运动段起步时，初始化可能在一帧猛晃里锁锚（run_01 的 105.6），勾上就只等安静窗。
+        self.static_start = tk.BooleanVar(value=False)
+        # 最后一步是选法：dir 选已有目录，save 给还没写出来的文件，None 是数字输入不给按钮。
         labels = (("unav_vio 构建目录", "build", 44, "dir"),
                   ("MAX_FRAMES（0=整段）", "max_frames", 8, None),
                   ("输出 .rrd", "rrd", 44, "save"),
-                  ("产物目录（必须为空）", "artifacts", 44, "dir"))
+                  ("产物目录（必须为空）", "artifacts", 44, "dir"),
+                  ("JSONL 观察留档", "jsonl", 44, "jsonl"),
+                  ("display-hz（空=每帧）", "display_hz", 8, None))
         for row, (label, key, width, style) in enumerate(labels):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="e", padx=6, pady=2)
             ttk.Entry(frame, textvariable=self.replay_fields[key], width=width).grid(
@@ -432,26 +642,45 @@ class App:
                     row=row, column=2, sticky="w", padx=(6, 0))
         overrides = ttk.Frame(frame)
         overrides.grid(row=len(labels), column=1, columnspan=2, sticky="w")
-        ttk.Label(frame, text="回放侧覆盖（空=默认）").grid(row=len(labels), column=0,
+        ttk.Label(frame, text="回放侧覆盖（空=不改）").grid(row=len(labels), column=0,
                                                      sticky="e", padx=6, pady=2)
         for key, caption in (("image_levels", "levels 下限"), ("image_lap", "lap 下限"),
-                             ("td_ms", "td ms")):
+                             ("td_ms", "td ms"), ("wait_ms", "停滞 ms")):
             ttk.Label(overrides, text=caption).pack(side="left")
             ttk.Entry(overrides, textvariable=self.replay_fields[key], width=5).pack(
                 side="left", padx=(2, 8))
-        ttk.Label(overrides, text="D435i 暗光红外的 lap 中位数实测 ~1.9，默认 50 会拒；"
-                                  "sensor.yaml 里的 timeshift 让初始化失败时填 0")\
+        ttk.Label(overrides, text="lap 已预填 1、levels 25：D435i 暗光红外过不了上游默认 50/32；"
+                                  "td 留空用 sensor.yaml（Gate 1 成功跑是 6 ms，不要一上来填 0）；"
+                                  "停滞 ms 只在留档写到一半被 TimedOut 时才需要抬")\
             .pack(side="left", padx=6)
         ttk.Checkbutton(frame, text="要求 GT（本机没有位姿流，默认关）",
                         variable=self.require_gt).grid(row=len(labels) + 1, column=1, sticky="w")
+        ttk.Checkbutton(frame, text="前端对比度归一化（D435i 暗光红外建议开）",
+                        variable=self.frontend_contrast).grid(
+            row=len(labels) + 1, column=2, sticky="w")
+        ttk.Checkbutton(frame, text="只准静止段起步（等安静窗，防锁错锚点）",
+                        variable=self.static_start).grid(row=len(labels) + 2, column=1, sticky="w")
         ttk.Checkbutton(frame, text="把双目画面写进 .rrd（约 0.56 MB/帧）",
-                        variable=self.rerun_images).grid(row=len(labels) + 1, column=2, sticky="w")
+                        variable=self.rerun_images).grid(row=len(labels) + 2, column=2, sticky="w")
         buttons = ttk.Frame(frame)
-        buttons.grid(row=len(labels) + 2, column=1, columnspan=2, sticky="w", pady=4)
-        self.replay_button = ttk.Button(buttons, text="回放选中数据集", command=self.run_replay)
+        buttons.grid(row=len(labels) + 3, column=1, columnspan=2, sticky="w", pady=4)
+        self.replay_button = ttk.Button(buttons, text="回放写 .rrd", command=self.run_replay)
         self.replay_button.pack(side="left", padx=4)
-        ttk.Button(buttons, text="打开 Rerun viewer", command=self.open_viewer).pack(side="left", padx=4)
-        ttk.Label(buttons, text="viewer 打开的是文件，不会打断回放").pack(side="left", padx=6)
+        self.archive_button = ttk.Button(buttons, text="生成 JSONL", command=self.run_generate_jsonl)
+        self.archive_button.pack(side="left", padx=4)
+        self.playback_button = ttk.Button(buttons, text="JSONL 在线播放", command=self.run_jsonl_playback)
+        self.playback_button.pack(side="left", padx=4)
+        ttk.Button(buttons, text="出 trajectory.png", command=self.run_report).pack(side="left", padx=4)
+        viewers = ttk.Frame(frame)
+        viewers.grid(row=len(labels) + 4, column=1, columnspan=2, sticky="w", pady=(0, 4))
+        self.live_open_button = ttk.Button(viewers, text="打开 live Viewer", command=self.open_live_viewer)
+        self.live_open_button.pack(side="left", padx=4)
+        self.live_close_button = ttk.Button(viewers, text="关闭 live Viewer", command=self.close_live_viewer)
+        self.live_close_button.pack(side="left", padx=4)
+        ttk.Button(viewers, text="打开 .rrd", command=self.open_viewer).pack(side="left", padx=4)
+        ttk.Label(viewers, text="JSONL 要先生成再播；关闭只杀本界面拉起的 Viewer").pack(
+            side="left", padx=6)
+        self._set_live_viewer_running(False)
 
     # --- 动作 -------------------------------------------------------------
 
@@ -472,7 +701,7 @@ class App:
             self.fields["out"].set(chosen)
 
     def pick_replay_path(self, key: str, style: str) -> None:
-        """dir 只能选存在的目录；.rrd 往往还没生成，所以它走 save 对话框，别拿 askdirectory 逼用户先建文件。"""
+        """dir 只能选存在的目录；.rrd / JSONL 往往还没生成，所以走 save 对话框。"""
         from tkinter import filedialog
 
         base = Path(self.replay_fields[key].get() or str(Path.home()))
@@ -481,6 +710,12 @@ class App:
                 initialdir=str(nearest_existing_dir(base.parent if base.suffix else base)),
                 initialfile=base.name if base.suffix else "",
                 defaultextension=".rrd", filetypes=[("Rerun 文档", "*.rrd"), ("所有文件", "*")])
+        elif style == "jsonl":
+            chosen = filedialog.asksaveasfilename(
+                initialdir=str(nearest_existing_dir(base.parent if base.suffix else base)),
+                initialfile=base.name if base.suffix else "observation.jsonl",
+                defaultextension=".jsonl",
+                filetypes=[("观察留档", "*.jsonl"), ("所有文件", "*")])
         else:
             chosen = filedialog.askdirectory(initialdir=str(nearest_existing_dir(base)))
         if chosen:
@@ -550,30 +785,85 @@ class App:
             return ""
         return raw
 
-    def run_replay(self) -> None:
+    def _replay_binary(self) -> Path | None:
+        build = Path(self.replay_fields["build"].get())
+        binary = find_replay_binary(build)
+        if binary is None:
+            self.log(f"[错误] {build} 里没有 vio_mh01_replay / vio_mh01_replay_test。构建它：")
+            self.log(f"  cmake -S {build.parent} -B {build} -DCMAKE_BUILD_TYPE=Debug "
+                     "-DCMAKE_PREFIX_PATH=<uav_nav 的 sdk-install>")
+            self.log(f"  cmake --build {build} --target vio_mh01_replay --parallel")
+        return binary
+
+    def _start_mh01_replay(self, rrd: Path | None, artifacts: Path | None,
+                           jsonl: Path | None) -> None:
         dataset = self.selected_dataset()
         if dataset is None:
             self.log("[提示] 先在列表里点一个数据集")
             return
-        build = Path(self.replay_fields["build"].get())
-        binary = find_replay_binary(build)
+        binary = self._replay_binary()
         if binary is None:
-            self.log(f"[错误] {build} 里没有 vio_mh01_replay_test。构建它：")
-            self.log(f"  cmake -S {build.parent} -B {build} -DCMAKE_BUILD_TYPE=Debug "
-                     "-DCMAKE_PREFIX_PATH=<uav_nav 的 sdk-install>")
-            self.log(f"  cmake --build {build} --target vio_mh01_replay_test --parallel")
             return
-        # 留空 = 不要那份产物：replay_env 收到 None 就不设对应环境变量，
-        # 省得 Path("") 变成 "." 传给子进程当输出路径。
+        if artifacts is not None and artifacts.exists() and any(artifacts.iterdir()):
+            self.log(f"[错误] 产物目录非空，回放侧拒绝覆盖：{artifacts}")
+            return
+        if jsonl is not None and jsonl.exists():
+            self.log(f"[错误] JSONL 已存在，上游拒绝覆盖：{jsonl}。换路径或先删掉再生成。")
+            return
+        frames = int(self.replay_fields["max_frames"].get() or 0)
+        td_raw = self.numeric_field("td_ms", "相机时间偏移")
+        if not td_raw:
+            # 覆盖框留空 = 按数据集 sensor.yaml 的 td 跑。录制产物本不该有这个键；
+            # 它一旦带非零值，实测全程回放会在中段停机（轨迹/标记全消失，画面照常）。
+            td_in_dataset = read_timeshift_ms(dataset)
+            if td_in_dataset is not None and td_in_dataset != 0.0:
+                self.log(f"[提示] {dataset.name} 的 cam0/sensor.yaml 手写了 timeshift_to_imu_ms="
+                         f"{td_in_dataset:g} ms（录制端从不写这个键）。实测非零 td 会让全程回放在"
+                         "中段停机：那之后轨迹/landmark/特征标记全部消失而画面照常。在「回放侧"
+                         "覆盖」的 td 框填 0 即可恢复整段回放（根治是删掉那行键）；rh verify 也"
+                         "会报这一条。")
+            if self.frontend_contrast.get():
+                # 对比度归一化会把近常量的暗光红外压到 levels 下限之下：这是 Gate 1 实测过的组合，
+                # 提前说清，免得把「前置门拒绝」误读成素材不可用。
+                self.log("[提示] 勾了对比度归一化时，暗光素材可能连「灰度级下限」都过不了："
+                         "若前置门以「图像接近常量」拒绝，在 levels 框填 1 放宽（观察侧旋钮）。")
+        if self.spawn([str(binary)], replay_env(
+                dataset, frames, self.require_gt.get(), rrd, artifacts, self.rerun_images.get(),
+                self.numeric_field("image_levels", "levels 下限"),
+                self.numeric_field("image_lap", "lap 下限"),
+                td_raw,
+                jsonl, self.frontend_contrast.get(),
+                allow_motion_start=False if self.static_start.get() else None,
+                wait_ms=self.numeric_field("wait_ms", "停滞预算"))):
+            self._set_replay_busy(True)
+            self.writing_rrd = rrd
+            self.writing_jsonl = jsonl
+
+    def run_report(self) -> None:
+        """出 trajectory.png。产物目录里没有 estimated.tum 时点空是常态，所以先说清缺什么。"""
+        raw = self.replay_fields["artifacts"].get().strip()
+        artifacts = Path(raw) if raw else None
+        if artifacts is None or not (artifacts / "estimated.tum").is_file():
+            self.log(f"[提示] {raw or '产物目录'} 里没有 estimated.tum：先跑一次带产物目录的回放")
+            return
+        self.spawn(build_report_command(self.root_dir, artifacts))
+
+    def run_replay(self) -> None:
+        if self.selected_dataset() is None:
+            self.log("[提示] 先在列表里点一个数据集")
+            return
         rrd_raw = self.replay_fields["rrd"].get().strip()
         art_raw = self.replay_fields["artifacts"].get().strip()
         rrd = Path(rrd_raw) if rrd_raw else None
         artifacts = Path(art_raw) if art_raw else None
-        if artifacts is not None and artifacts.exists() and any(artifacts.iterdir()):
-            self.log(f"[错误] 产物目录非空，回放侧拒绝覆盖：{artifacts}")
-            return
         if rrd is not None and rrd.exists():
             self.log(f"[提示] 将覆盖已有 .rrd：{rrd}")
+        jsonl_raw = self.replay_fields["jsonl"].get().strip()
+        jsonl = Path(jsonl_raw) if jsonl_raw else None
+        if jsonl is not None and jsonl.exists():
+            self.log(f"[提示] JSONL 已存在，这次只写 .rrd，不改观察留档：{jsonl}。"
+                     "要重写请换路径或先删掉再点「生成 JSONL」。")
+            jsonl = None
         frames = int(self.replay_fields["max_frames"].get() or 0)
         with_images = self.rerun_images.get() and rrd is not None
         if self.rerun_images.get() and rrd is None:
@@ -588,19 +878,105 @@ class App:
                          f"{need / 1e6:.0f} MB，写满会整段报废")
         else:
             picture = "只有轨迹/点云，没有画面"
-        self.log(f"回放 {dataset.name}：MAX_FRAMES={frames}，"
+        dataset = self.selected_dataset()
+        name = dataset.name if dataset is not None else "?"
+        archive_note = f"，顺带 JSONL → {jsonl}" if jsonl else "，不写 JSONL"
+        wait_raw = self.replay_fields["wait_ms"].get().strip()
+        wait_note = f"，停滞预算 {wait_raw} ms" if wait_raw else ""
+        self.log(f"回放写 .rrd {name}：MAX_FRAMES={frames}，"
                  f"require_gt={'1' if self.require_gt.get() else '0'}，"
+                 f"BOOTSTRAP_FRAMES={default_bootstrap_frames(frames)}，"
+                 f"FRONTEND_CONTRAST={'1' if self.frontend_contrast.get() else '0'}，"
+                 f"静止起步={'1' if self.static_start.get() else '0'}，"
                  f"{'.rrd → ' + str(rrd) if rrd else '不存 .rrd（字段留空了）'}，{picture}"
-                 f"（Debug 下 300 帧约 5 分钟）")
-        self.spawn([str(binary)], replay_env(
-            dataset, frames, self.require_gt.get(), rrd, artifacts, self.rerun_images.get(),
-            self.numeric_field("image_levels", "levels 下限"),
-            self.numeric_field("image_lap", "lap 下限"),
-            self.numeric_field("td_ms", "相机时间偏移")))
-        # 启动失败时 spawn 只留一行日志、self.process 仍为 None：这时别把按钮锁死。
-        if self.process is not None:
-            self.replay_button.configure(state="disabled")
-            self.writing_rrd = rrd
+                 f"{archive_note}{wait_note}（Debug 下 300 帧约 5 分钟）")
+        self._start_mh01_replay(rrd, artifacts, jsonl)
+
+    def run_generate_jsonl(self) -> None:
+        """跑一遍 VIO，只写观察留档，不落 .rrd。"""
+        if self.selected_dataset() is None:
+            self.log("[提示] 先在列表里点一个数据集")
+            return
+        jsonl_raw = self.replay_fields["jsonl"].get().strip()
+        if not jsonl_raw:
+            self.log("[提示] 「JSONL 观察留档」是空的：填好要写出的路径再生成")
+            return
+        jsonl = Path(jsonl_raw)
+        frames = int(self.replay_fields["max_frames"].get() or 0)
+        dataset = self.selected_dataset()
+        name = dataset.name if dataset is not None else "?"
+        self.log(f"生成 JSONL {name} → {jsonl}：MAX_FRAMES={frames}，"
+                 f"require_gt={'1' if self.require_gt.get() else '0'}，"
+                 f"BOOTSTRAP_FRAMES={default_bootstrap_frames(frames)}，"
+                 f"FRONTEND_CONTRAST={'1' if self.frontend_contrast.get() else '0'}，"
+                 f"IMAGE_LEVELS_MIN={self.replay_fields['image_levels'].get().strip() or '未设→上游默认32'}，"
+                 f"IMAGE_LAP_MIN={self.replay_fields['image_lap'].get().strip() or '未设→上游默认50'}，"
+                 "不写 .rrd（仍是一遍 VIO，Debug 下 300 帧约 5 分钟）")
+        self._start_mh01_replay(None, None, jsonl)
+
+    def run_jsonl_playback(self) -> None:
+        """按源时间把 JSONL 观察留档推给 live Viewer，不重跑 VIO。"""
+        build = Path(self.replay_fields["build"].get())
+        binary = find_playback_binary(build)
+        if binary is None:
+            self.log(f"[错误] {build} 里没有 vio_observation_playback。"
+                     "指向含 uav_nav_rerun 的新 unav_vio 构建（例如 build-rerun060-release）。")
+            return
+        jsonl_raw = self.replay_fields["jsonl"].get().strip()
+        if not jsonl_raw:
+            self.log("[提示] 「JSONL 观察留档」是空的：先回放写出，或填已有 observation.jsonl")
+            return
+        archive = Path(jsonl_raw)
+        if not archive.is_file():
+            self.log(f"[提示] {archive} 还不存在。先点「生成 JSONL」（跑一遍 VIO，"
+                     "环境变量 UNAV_VIO_OBSERVATION_ARCHIVE）。")
+            return
+        hz = self.numeric_field("display_hz", "display-hz")
+        dataset = self.selected_dataset()
+        argv = build_playback_command(binary, archive, dataset, hz)
+        self.log(f"JSONL 在线播放 {archive.name}：display-hz="
+                 f"{hz if hz else '0（每帧）'}；先确认 live Viewer 已在 9876 监听")
+        if self.spawn(argv):
+            self._set_replay_busy(True)
+
+    def open_live_viewer(self) -> None:
+        """live 推流端点写死 rerun+http://127.0.0.1:9876/proxy，必须先有监听者。"""
+        if self.live_viewer is not None and self.live_viewer.poll() is None:
+            self.log(f"[提示] live Viewer 已由本界面拉起（pid {self.live_viewer.pid}），先关再开")
+            return
+        viewer = rerun_viewer()
+        if viewer is None:
+            self.log("[错误] 没找到 Rerun 查看器（PATH 与 ~/桌面 都没有 rerun-cli-*）。"
+                     "它必须是 0.37.x，且不随本项目安装。")
+            return
+        argv = live_viewer_command(viewer)
+        self.log("$ " + " ".join(shlex.quote(part) for part in argv) + "   （新窗口，JSONL 在线播用）")
+        try:
+            self.live_viewer = subprocess.Popen(argv, start_new_session=True)
+        except OSError as error:
+            self.log(f"[启动失败] {error}")
+            self.live_viewer = None
+            return
+        self._set_live_viewer_running(True)
+
+    def close_live_viewer(self, quiet: bool = False) -> None:
+        proc = self.live_viewer
+        if proc is None:
+            if not quiet:
+                self.log("[提示] 没有由本界面拉起的 live Viewer。"
+                         "你在终端里开的请在那边停（Ctrl+C）。")
+            return
+        if proc.poll() is not None:
+            if not quiet:
+                self.log("live Viewer 已经不在了")
+            self.live_viewer = None
+            self._set_live_viewer_running(False)
+            return
+        if not quiet:
+            self.log(f"结束 live Viewer（pid {proc.pid}）")
+        kill_process_group(proc)
+        self.live_viewer = None
+        self._set_live_viewer_running(False)
 
     def open_viewer(self) -> None:
         viewer = rerun_viewer()
@@ -657,11 +1033,24 @@ def selftest(root_dir: Path) -> int:
     env = replay_env(Path("/d/room_07"), 300, False, Path("/tmp/a.rrd"), None)
     check(env["UNAV_VIO_MH01_REQUIRE_GT"] == "0", "require_gt 显式落到环境")
     check(env["UNAV_VIO_MH01_MAX_FRAMES"] == "300", "MAX_FRAMES 落到环境")
+    check(env["UNAV_VIO_MH01_BOOTSTRAP_FRAMES"] == "300",
+          "300 帧短窗 bootstrap=max(300,240)，避免上游默认 150 提前放弃")
     check("UNAV_VIO_REPLAY_ARTIFACT_DIR" not in env and env["UNAV_VIO_RERUN_SAVE"] == "/tmp/a.rrd",
           "只设给过路径的那两个产物变量")
     bare = replay_env(Path("/d/room_07"), 0, True, None, None)
     check("UNAV_VIO_RERUN_SAVE" not in bare and "UNAV_VIO_REPLAY_ARTIFACT_DIR" not in bare,
           ".rrd/产物字段留空就是不存，不会把 '.' 传给子进程")
+    check(bare["UNAV_VIO_MH01_BOOTSTRAP_FRAMES"] == "8192",
+          "整段（MAX_FRAMES=0）bootstrap 用够用的上限")
+    check(replay_env(Path("/d"), 80, False, None, None)["UNAV_VIO_MH01_BOOTSTRAP_FRAMES"] == "240",
+          "短于 240 的窗也至少等到上游「及时初始化」判据")
+    check(default_bootstrap_frames(300) == 300 and default_bootstrap_frames(0) == 8192,
+          "bootstrap 纯函数与 replay_env 同口径")
+    check("UNAV_VIO_MH01_FRONTEND_CONTRAST" not in env,
+          "对比度归一化默认不设（GUI 勾了才开）")
+    check(replay_env(Path("/d"), 300, False, None, None,
+                     frontend_contrast=True)["UNAV_VIO_MH01_FRONTEND_CONTRAST"] == "1",
+          "勾了对比度就设 UNAV_VIO_MH01_FRONTEND_CONTRAST=1")
     # SAVE 模式默认不落图（上游 vio_mh01_replay_test.cpp 的 stereo_images 判定），必须显式开。
     check("UNAV_VIO_RERUN_IMAGES" not in replay_env(Path("/d"), 300, False, Path("/t/a.rrd"), None),
           "不开开关时 .rrd 里只有轨迹，行为与上游默认一致")
@@ -678,6 +1067,42 @@ def selftest(root_dir: Path) -> int:
           "td 覆盖成 0 也要传（数据集里写了 timeshift 时这是唯一清零办法）")
     check("UNAV_VIO_MH01_TD_MS" not in replay_env(Path("/d"), 300, False, None, None),
           "td 留空时不覆盖，交给数据集的 sensor.yaml")
+    check(replay_env(Path("/d"), 300, False, None, None,
+                     allow_motion_start=False)["UNAV_VIO_MH01_ALLOW_MOTION_START"] == "0",
+          "勾了「只准静止段起步」就设 ALLOW_MOTION_START=0")
+    check("UNAV_VIO_MH01_ALLOW_MOTION_START" not in replay_env(Path("/d"), 300, False, None, None),
+          "不勾时不设：上游默认就允许运动段起步，没必要显式写 1")
+    check(replay_env(Path("/d"), 300, False, None, None,
+                     wait_ms="600000")["UNAV_VIO_MH01_WAIT_MS"] == "600000",
+          "停滞预算填了才透传")
+    check("UNAV_VIO_MH01_WAIT_MS" not in replay_env(Path("/d"), 300, False, None, None),
+          "停滞预算留空时用上游默认 120000")
+    report = build_report_command(Path("/repo"), Path("/d/artifacts"))
+    check(report[1] == "/repo/tools/rh_report.py" and report[-1] == "/d/artifacts",
+          f"出图命令指向仓库里的 rh_report.py: {report}")
+    archive_env = replay_env(Path("/d"), 300, False, None, None,
+                             observation_archive=Path("/tmp/o.jsonl"))
+    check(archive_env["UNAV_VIO_OBSERVATION_ARCHIVE"] == "/tmp/o.jsonl",
+          "填了 JSONL 路径就设 UNAV_VIO_OBSERVATION_ARCHIVE")
+    check(archive_env["UNAV_VIO_REQUIRE_OBSERVATION_ARCHIVE"] == "1",
+          "写 JSONL 时观察失败单独进退出码，不改写 vio_result")
+    check("UNAV_VIO_OBSERVATION_ARCHIVE" not in replay_env(Path("/d"), 300, False, None, None),
+          "JSONL 留空就不设，避免把 '.' 传给子进程")
+    play = build_playback_command(Path("/b/vio_observation_playback"), Path("/t/o.jsonl"),
+                                  Path("/d/room_07"), "5")
+    check(play[:4] == ["/b/vio_observation_playback", "--archive", "/t/o.jsonl", "--connect"],
+          "在线播放固定 --archive 与 --connect")
+    check(play[play.index("--dataset") + 1] == "/d/room_07", "--dataset 透传选中数据集")
+    check(play[play.index("--display-hz") + 1] == "5", "--display-hz 5 抽帧")
+    check("--rate" not in build_playback_command(Path("/b/p"), Path("/t/o.jsonl"), None, ""),
+          "display-hz 留空且 rate=1 时不传多余开关（每帧都发）")
+    check("--dataset" not in build_playback_command(Path("/b/p"), Path("/t/o.jsonl"), None, "5"),
+          "没选数据集时不传 --dataset，交给留档头的 dataset_path")
+    live = live_viewer_command(Path("/v/rerun"))
+    check(live[:4] == ["/v/rerun", "--serve-web", "--bind", "127.0.0.1"],
+          "live Viewer 走 --serve-web 绑定本机")
+    check(live[live.index("--port") + 1] == "9876", "live 端点端口 9876")
+    check(live[live.index("--memory-limit") + 1] == "4GB", "live Viewer 带 4GB 限额")
 
     check(record_problems(cfg, Path("/")) == [], "合法参数不该报警")
     bad = dict(cfg, seq="has space", still="1", excite="1", tail="0", duration="10")
@@ -722,8 +1147,26 @@ def selftest(root_dir: Path) -> int:
         check(nearest_existing_dir(Path("/no/such/place")).is_dir(),
               "任意绝对路径都能停在一个真实目录（最坏是根）")
 
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = Path(tmp) / "seq_a"
+        (ds / "mav0" / "cam0").mkdir(parents=True)
+        check(read_timeshift_ms(ds) is None, "sensor.yaml 不存在时 td 视为未写")
+        sensor = ds / "mav0" / "cam0" / "sensor.yaml"
+        sensor.write_text("distortion_coefficients: [0, 0, 0, 0]\n"
+                          "timeshift_to_imu_ms: 6.0  # estimate_td 实测\n")
+        check(read_timeshift_ms(ds) == 6.0, "td 读数剥掉行内注释")
+        sensor.write_text("timeshift_to_imu_ms: 0\n")
+        check(read_timeshift_ms(ds) == 0.0, "手写 0 也读得出来")
+        sensor.write_text("rate_hz: 30\n")
+        check(read_timeshift_ms(ds) is None, "缺键返回 None")
+        sensor.write_text("timeshift_to_imu_ms: bad\n")
+        check(read_timeshift_ms(ds) is None, "td 值坏时返回 None 而不是抛异常")
+
     print(f"[info] rh：{find_rh(root_dir) or '未构建'}")
     print(f"[info] Rerun viewer：{rerun_viewer() or '未找到'}")
+    print(f"[info] 默认 unav_vio 构建：{default_unav_build()}")
+    print(f"[info] 回放二进制：{find_replay_binary(default_unav_build()) or '未找到'}")
+    print(f"[info] JSONL 播放器：{find_playback_binary(default_unav_build()) or '未找到'}")
     print(f"\nselftest：{'全部通过' if not failures else f'{len(failures)} 项失败'}")
     return 1 if failures else 0
 
