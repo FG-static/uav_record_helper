@@ -177,6 +177,47 @@ RH_TEST(euroc_format_rejects_malformed_lists) {
     CHECK(!rh::fmt::ReadYamlBlock(path, "T_BS", &block, &error));
 }
 
+RH_TEST(euroc_format_optional_scalar) {
+    // ReadYamlScalarIfPresent 服务于「录制端不写、出现即事后手改」的键（timeshift_to_imu_ms）：
+    // 缺键是正常情况必须与「键存在但值坏」严格区分，前者不能报错。
+    const rh::testing::TempDirectory temp("rh-yaml-optional");
+    const std::string path = rh::fmt::JoinPath(temp.path(), "sensor.yaml");
+    std::string error;
+    CHECK(rh::fmt::WriteWholeFile(path, "sensor_type: camera\nrate_hz: 30\n", &error));
+
+    bool present = true;
+    double value = 0.0;
+    CHECK(rh::fmt::ReadYamlScalarIfPresent(path, "timeshift_to_imu_ms", &present, &value, &error));
+    CHECK(!present);
+
+    CHECK(rh::fmt::WriteWholeFile(
+        path, "sensor_type: camera\nrate_hz: 30\ntimeshift_to_imu_ms: 6.0  # 实测\n", &error));
+    present = false;
+    CHECK(rh::fmt::ReadYamlScalarIfPresent(path, "timeshift_to_imu_ms", &present, &value, &error));
+    CHECK(present);
+    CHECK_NEAR(value, 6.0, 0.0);
+
+    // 带注释、负数、整数写法都要能读。
+    CHECK(rh::fmt::WriteWholeFile(path, "timeshift_to_imu_ms: -2\n", &error));
+    present = false;
+    CHECK(rh::fmt::ReadYamlScalarIfPresent(path, "timeshift_to_imu_ms", &present, &value, &error));
+    CHECK(present);
+    CHECK_NEAR(value, -2.0, 0.0);
+
+    // 键存在但值坏：报错而不是静默当缺键。
+    CHECK(rh::fmt::WriteWholeFile(path, "timeshift_to_imu_ms: six\n", &error));
+    present = false;
+    CHECK(!rh::fmt::ReadYamlScalarIfPresent(path, "timeshift_to_imu_ms", &present, &value, &error));
+    // 文件本身读不了：同样报错。
+    CHECK(!rh::fmt::ReadYamlScalarIfPresent(
+        rh::fmt::JoinPath(temp.path(), "missing.yaml"), "a", &present, &value, &error));
+    CHECK(!present);
+    // 旧接口语义不变：缺键仍报 key not found。
+    CHECK(rh::fmt::WriteWholeFile(path, "rate_hz: 30\n", &error));
+    CHECK(!rh::fmt::ReadYamlScalar(path, "timeshift_to_imu_ms", &value, &error));
+    CHECK(error.find("key not found") != std::string::npos);
+}
+
 RH_TEST(euroc_format_paths) {
     const rh::testing::TempDirectory temp("rh-paths");
     const std::string deep = rh::fmt::JoinPath(rh::fmt::JoinPath(temp.path(), "mav0"), "cam0/data");

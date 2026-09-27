@@ -4,6 +4,7 @@
 #include "record_helper/verify.hpp"
 #include "synthetic.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -350,8 +351,66 @@ RH_TEST(verify_flags_dataset_too_short_for_replay) {
     CHECK(mentions_seconds);
 }
 
-RH_TEST(verify_rejects_missing_layout) {
-    const rh::testing::TempDirectory temp("rh-verify-empty");
+RH_TEST(verify_flags_hand_written_timeshift) {
+    // 录制端从不写 timeshift_to_imu_ms（共享曝光时间戳下 td=0 自洽）；出现即事后手改。
+    // 实测非零 td 会让较新的回放中段 NumericalFailure 停机，所以自带 record_summary.yaml
+    // 的包按契约判失败，外来包只提醒；提示里必须给出 UNAV_VIO_MH01_TD_MS=0 这条对照路。
+    {
+        const std::string root = Fixture().Copy("timeshift-own");
+        const std::string path = rh::fmt::JoinPath(root, "mav0/cam0/sensor.yaml");
+        std::string content;
+        std::string error;
+        CHECK(rh::fmt::ReadWholeFile(path, &content, &error));
+        CHECK(rh::fmt::WriteWholeFile(path, content + "timeshift_to_imu_ms: 6.0  # 实测\n", &error));
+        const auto report = rh::VerifyDataset(root, FixtureOptions());
+        CHECK(HasFailing(report, "camera.timeshift"));
+        CHECK(!report.ok());
+        bool mentions_override = false;
+        for (const auto& check : report.checks) {
+            if (check.id == "camera.timeshift" && check.status == rh::CheckStatus::Fail) {
+                mentions_override = check.detail.find("UNAV_VIO_MH01_TD_MS=0") != std::string::npos;
+            }
+        }
+        CHECK(mentions_override);
+    }
+    {
+        // 外来数据集（没有 record_summary.yaml）：该键上游合法，只提醒实测风险，不判死。
+        const std::string root = Fixture().Copy("timeshift-foreign");
+        const std::string path = rh::fmt::JoinPath(root, "mav0/cam0/sensor.yaml");
+        std::string content;
+        std::string error;
+        CHECK(rh::fmt::ReadWholeFile(path, &content, &error));
+        CHECK(rh::fmt::WriteWholeFile(path, content + "timeshift_to_imu_ms: 6.0\n", &error));
+        CHECK(std::remove(rh::fmt::JoinPath(root, "record_summary.yaml").c_str()) == 0);
+        const auto report = rh::VerifyDataset(root, FixtureOptions());
+        CHECK(HasCheck(report, "camera.timeshift", rh::CheckStatus::Warn));
+        CHECK(!HasFailing(report, "camera.timeshift"));
+    }
+    {
+        // 手写 0 与录制契约数值一致：WARN 提醒删掉，不判失败。
+        const std::string root = Fixture().Copy("timeshift-zero");
+        const std::string path = rh::fmt::JoinPath(root, "mav0/cam0/sensor.yaml");
+        std::string content;
+        std::string error;
+        CHECK(rh::fmt::ReadWholeFile(path, &content, &error));
+        CHECK(rh::fmt::WriteWholeFile(path, content + "timeshift_to_imu_ms: 0.0\n", &error));
+        const auto report = rh::VerifyDataset(root, FixtureOptions());
+        CHECK(HasCheck(report, "camera.timeshift", rh::CheckStatus::Warn));
+        CHECK(!HasFailing(report, "camera.timeshift"));
+    }
+    {
+        // 干净的录制产物不产生这条检查。
+        const auto report = rh::VerifyDataset(Fixture().valid_root(), FixtureOptions());
+        CHECK(report.checks.end() ==
+              std::find_if(report.checks.begin(),
+                           report.checks.end(),
+                           [](const rh::CheckResult& check) {
+                               return check.id == "camera.timeshift";
+                           }));
+    }
+}
+
+RH_TEST(verify_rejects_missing_layout) {    const rh::testing::TempDirectory temp("rh-verify-empty");
     const auto report = rh::VerifyDataset(temp.path(), FixtureOptions());
     CHECK(HasFailing(report, "layout"));
     CHECK(!report.ok());

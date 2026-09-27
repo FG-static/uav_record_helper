@@ -43,6 +43,14 @@ ReadYamlBlock(const std::string& path, const std::string& key, YamlBlock* out, s
 [[nodiscard]] bool
 ReadYamlScalar(const std::string& path, const std::string& key, double* out, std::string* error);
 
+// 可选标量键：key 缺失是正常情况（返回 true 且 *present=false），键存在但值不是有限数才报错。
+// 用于「录制端不写、出现即说明文件被事后改过」的键，例如 timeshift_to_imu_ms。
+[[nodiscard]] bool ReadYamlScalarIfPresent(const std::string& path,
+                                           const std::string& key,
+                                           bool* present,
+                                           double* out,
+                                           std::string* error);
+
 // 与 read_csv_rows 一致：跳过空行与 '#' 开头的表头，逗号切分并逐字段去空白。
 [[nodiscard]] std::vector<std::vector<std::string>> SplitCsvRows(const std::string& content);
 

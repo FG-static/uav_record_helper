@@ -327,10 +327,11 @@ bool ReadYamlBlock(const std::string& path,
     return fail("key not found");
 }
 
-bool ReadYamlScalar(const std::string& path,
-                    const std::string& key,
-                    double* out,
-                    std::string* error) {
+bool ReadYamlScalarIfPresent(const std::string& path,
+                             const std::string& key,
+                             bool* present,
+                             double* out,
+                             std::string* error) {
     std::string content;
     if (!ReadWholeFile(path, &content, error)) {
         return false;
@@ -351,15 +352,35 @@ bool ReadYamlScalar(const std::string& path,
             }
             return false;
         }
+        if (present != nullptr) {
+            *present = true;
+        }
         if (out != nullptr) {
             *out = parsed;
         }
         return true;
     }
-    if (error != nullptr) {
-        *error = path + " key " + key + ": key not found";
+    if (present != nullptr) {
+        *present = false;
     }
-    return false;
+    return true;
+}
+
+bool ReadYamlScalar(const std::string& path,
+                    const std::string& key,
+                    double* out,
+                    std::string* error) {
+    bool present = false;
+    if (!ReadYamlScalarIfPresent(path, key, &present, out, error)) {
+        return false;
+    }
+    if (!present) {
+        if (error != nullptr) {
+            *error = path + " key " + key + ": key not found";
+        }
+        return false;
+    }
+    return true;
 }
 
 std::vector<std::vector<std::string>> SplitCsvRows(const std::string& content) {

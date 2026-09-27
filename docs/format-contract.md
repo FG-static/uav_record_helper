@@ -25,7 +25,7 @@
 | 静止→运动边界（取最后一个） | `euroc_dataset.cpp:592+`（`find_static_motion_boundary`） | 开头必须真静止。回放仍取最后一个边界；录制阶段不因此改状态，写盘也不裁到该边界 |
 | anchor = 首个 ≥ `feed_start+60ms` 的帧，IMU 从 anchor 前 55 ms 起喂 | `vio_mh01_replay_test.cpp:522-530` | 帧密度要够（≥ ~18 Hz），IMU 必须在 anchor 之前就开始 |
 | 每个曝光区间右端要被 IMU 覆盖 | `vio_mh01_replay_test.cpp:598` + `initialization.cpp:236` | 停止时 IMU 要比最后一帧再跑一会儿（`--tail`） |
-| `g` 固定 9.81、`camera_time_offset_to_imu` 固定 0、`version` 固定 1 | `euroc_dataset.cpp:387-389`、`vio_mh01_replay_test.cpp:493` | 这三项**不能**由数据集文件表达，见下面的「无法表达的部分」 |
+| `g` 固定 9.81、`version` 固定 1 | `euroc_dataset.cpp:387-389`、`vio_mh01_replay_test.cpp:493` | 这两项**不能**由数据集文件表达；`camera_time_offset_to_imu` 自 2026-09-25 起改为读 `timeshift_to_imu_ms`，见下面的「无法表达」表 |
 
 ## RecordHelper 的对应做法
 
@@ -91,11 +91,11 @@
 想让 room_02 变得能用，只能重录：41 个不重叠的时间戳、被零阶保持污染过的 IMU、
 以及不存在的开头静止窗，都不是事后转换能补回来的（补出来的是假数据）。
 
-## 无法用数据集文件表达的三件事
+## 无法用数据集文件表达的只剩两件事
 
 | 项 | 上游现状 | 影响 |
 | --- | --- | --- |
-| `camera_time_offset_to_imu` | `euroc_dataset.cpp:389` 硬编码 0 ns | D435i 的 IMU 与图像共用同一设备时钟域，且我们写的是共享曝光时间戳，因此 offset=0 是自洽的；但这意味着**不要**用这份数据去验证非零时移路径 |
+| `camera_time_offset_to_imu` | ~~`euroc_dataset.cpp:389` 硬编码 0 ns~~ 2026-09-25 起改为读 `cam0/sensor.yaml` 的 `timeshift_to_imu_ms`（缺键按 0），**已可表达**，但录制端仍刻意不写 | D435i 的 IMU 与图像共用同一设备时钟域，且我们写的是共享曝光时间戳，offset=0 是自洽的。实测（2026-09-26 全矩阵 A/B）非零 td 会让全程回放在中段 NumericalFailure 停机——默认 bootstrap 下 ~200 帧（states=0），加长 `BOOTSTRAP_FRAMES` 后 461 帧（健康门连续 5 帧不健康），td=0 则整段可回放；因此 `rh verify` 把「录制产物里手写该键」判为 FAIL，外来数据集给 WARN |
 | `imu_noise.g` | `euroc_dataset.cpp:387` 硬编码 9.81 | 录制端只能要求静止段 `‖a‖` 与 9.81 相符（`verify` 的 `initialization.gravity`，容差 0.5 m/s² 取自 `InitializerConfig::max_static_accel_norm_error_mps2`） |
 | `calibration.version` | `vio_mh01_replay_test.cpp:493` 传入常量 1 | 无影响，录制端不写这个字段 |
 

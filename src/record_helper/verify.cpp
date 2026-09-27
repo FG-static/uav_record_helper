@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 
 #include "record_helper/euroc_format.hpp"
@@ -424,6 +425,48 @@ void CheckImages(const std::string& mav0,
                     std::to_string(bad) + (bad > 0 ? "：" + first_error : ""));
 }
 
+// timeshift_to_imu_ms 是新版回放才会读的键，录制端从不写它：D435i 的 IMU 与图像同用一个
+// 设备时钟域，共享曝光时间戳下 td=0 自洽。因此键一旦出现就是事后手改（例如 estimate_td.py
+// 实测后回写）。实测（2026-09-26，d435i_20260924_164630，同一二进制 A/B）非零 td 会让全程
+// 回放在中段停机：默认 bootstrap 下初始化被拖出预算（states=0，~200 帧处 NumericalFailure）；
+// 加长 BOOTSTRAP_FRAMES 后也会在数百帧处被健康门（连续 5 帧不健康）停机——轨迹/landmark/
+// 特征标记从那一刻全部消失而画面照常。td=0 则整段可回放。本工具自己的录制（有
+// record_summary.yaml）按契约判失败；外来数据集该键上游合法，只提醒。
+void CheckCameraTimeshift(const std::string& mav0,
+                          const std::string& camera_dir,
+                          bool own_recording,
+                          VerificationReport* report) {
+    const std::string path = fmt::JoinPath(mav0, camera_dir + "/sensor.yaml");
+    bool present = false;
+    double value = 0.0;
+    std::string error;
+    if (!fmt::ReadYamlScalarIfPresent(path, "timeshift_to_imu_ms", &present, &value, &error)) {
+        report->Add(CheckStatus::Warn, "camera.timeshift", path + " 读不出数值: " + error);
+        return;
+    }
+    if (!present) {
+        return;
+    }
+    if (std::abs(value) <= 1e-12) {
+        report->Add(CheckStatus::Warn,
+                    "camera.timeshift",
+                    path + " 手写了 timeshift_to_imu_ms=0：数值与录制契约一致（上游对缺键也按 0 "
+                           "处理），但录制端从不写这个键，建议删掉以保持录制产物原样");
+        return;
+    }
+    const CheckStatus status = own_recording ? CheckStatus::Fail : CheckStatus::Warn;
+    report->Add(status,
+                "camera.timeshift",
+                path + " 手写了 timeshift_to_imu_ms=" + fmt::FormatDouble(value) +
+                    " ms。录制端从不写这个键：共享曝光时间戳下 td=0 自洽，非零值只能来自事后"
+                    "手改；实测会让全程回放在中段停机（默认 bootstrap 下 states=0，加长后也会被"
+                    "健康门在数百帧处停机），症状是轨迹/landmark/特征标记从那一刻全部消失而画面"
+                    "照常。删掉该行，或用 UNAV_VIO_MH01_TD_MS=0 覆盖对照" +
+                    std::string(own_recording ? "（本包带 record_summary.yaml，属录制后改动，"
+                                                "按契约判失败）"
+                                              : "（外来数据集：该键上游合法，仅提醒实测风险）"));
+}
+
 } // namespace
 
 std::size_t VerificationReport::Count(CheckStatus status) const {
@@ -468,6 +511,14 @@ VerificationReport VerifyDataset(const std::string& dataset_root, const VerifyOp
         LoadCameraSensor(fmt::JoinPath(mav0, "cam0/sensor.yaml"), &camera0, &to_body0, &report) &&
         LoadCameraSensor(fmt::JoinPath(mav0, "cam1/sensor.yaml"), &camera1, &to_body1, &report);
     LoadImuSensor(fmt::JoinPath(mav0, "imu0/sensor.yaml"), &report.noise, &report);
+    {
+        // 与解析成败无关：文件只要在就得盯这个键。layout 检查已保证两个 sensor.yaml 存在。
+        std::error_code probe_error;
+        const bool own_recording = std::filesystem::is_regular_file(
+            std::filesystem::path(dataset_root) / "record_summary.yaml", probe_error);
+        CheckCameraTimeshift(mav0, "cam0", own_recording, &report);
+        CheckCameraTimeshift(mav0, "cam1", own_recording, &report);
+    }
     if (sensors_ok) {
         report.calibration.camera0 = camera0;
         report.calibration.camera1 = camera1;
