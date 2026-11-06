@@ -484,6 +484,22 @@ void VerificationReport::Add(CheckStatus status, std::string id, std::string det
 VerificationReport VerifyDataset(const std::string& dataset_root, const VerifyOptions& options) {
     VerificationReport report;
     report.dataset_root = dataset_root;
+    // EuRoC 共享文件名只用于回放兼容，不能把软件配对的卷帘数据认证为硬同步。
+    {
+        std::ifstream summary(fmt::JoinPath(dataset_root, "record_summary.yaml"));
+        std::string line;
+        while (std::getline(summary, line)) {
+            if (line == "recorder_backend: csi-mavlink") {
+                report.Add(
+                    CheckStatus::Fail,
+                    "capture.physical_contract",
+                    "CSI/MAVLink 为软件配对卷帘研究数据；曝光硬同步、全局快门及时间对齐未认证。"
+                    "EuRoC 格式可供研究回放，不能声明满足当前 unav_vio 物理输入契约");
+                break;
+            }
+        }
+    }
+
     const std::string mav0 = fmt::JoinPath(dataset_root, "mav0");
 
     std::vector<std::string> missing;

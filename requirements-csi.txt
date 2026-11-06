@@ -1,0 +1,4 @@
+# Linux GStreamer/PyGObject and PyYAML are provided by distro packages.
+# Tested with Python 3.9 and these protocol/serial versions.
+pyserial==3.5
+pymavlink==2.4.50

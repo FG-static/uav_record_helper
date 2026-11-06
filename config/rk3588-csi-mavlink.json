@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "cameras": [
+    {"device": "/dev/video22", "width": 1632, "height": 1224, "fps": 30, "format": "NV12", "readout_ns": 32749000},
+    {"device": "/dev/video31", "width": 1632, "height": 1224, "fps": 30, "format": "NV12", "readout_ns": 32749000}
+  ],
+  "mavlink": {
+    "serial": "/dev/serial/by-id/usb-MicoAir_MicoAir743v2_0-if00",
+    "baud": 115200,
+    "system_id": 1,
+    "component_id": 1,
+    "sensor_id": 0,
+    "body_frame": "frd",
+    "imu_rate_hz": 200
+  },
+  "pair_tolerance_ms": 3.0
+}

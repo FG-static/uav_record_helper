@@ -5,8 +5,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <locale>
 #include <sstream>
 #include <system_error>
+#include <type_traits>
+#include <utility>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -15,6 +19,74 @@ namespace rh::fmt {
 namespace {
 
 constexpr const char* kWhitespace = " \t\r\n";
+
+// GCC 10 缺少浮点 from_chars；回退仍只接受十进制语法并固定 classic locale。
+template <typename T, typename = void> struct HasFromChars : std::false_type {};
+template <typename T>
+struct HasFromChars<
+    T,
+    std::void_t<decltype(std::from_chars(
+        static_cast<const char*>(nullptr), static_cast<const char*>(nullptr), std::declval<T&>()))>>
+    : std::true_type {};
+
+bool DecimalToken(std::string_view token) {
+    std::size_t i = token.front() == '-' ? 1 : 0;
+    bool digit = false;
+    while (i < token.size() && token[i] >= '0' && token[i] <= '9') {
+        digit = true;
+        ++i;
+    }
+    if (i < token.size() && token[i] == '.') {
+        ++i;
+        while (i < token.size() && token[i] >= '0' && token[i] <= '9') {
+            digit = true;
+            ++i;
+        }
+    }
+    if (!digit)
+        return false;
+    if (i < token.size() && (token[i] == 'e' || token[i] == 'E')) {
+        ++i;
+        if (i < token.size() && (token[i] == '-' || token[i] == '+'))
+            ++i;
+        const auto begin = i;
+        while (i < token.size() && token[i] >= '0' && token[i] <= '9')
+            ++i;
+        if (i == begin)
+            return false;
+    }
+    return i == token.size();
+}
+
+template <typename T> bool ParseFloating(const std::string& token, T* value) {
+    if (!DecimalToken(token))
+        return false;
+    if constexpr (HasFromChars<T>::value) {
+        T candidate{};
+        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), candidate);
+        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() ||
+            !std::isfinite(candidate))
+            return false;
+        *value = candidate;
+        return true;
+    } else {
+        std::istringstream input(token);
+        input.imbue(std::locale::classic());
+        long double wide{};
+        input >> std::noskipws >> wide;
+        if (input.fail() || !input.eof() || !std::isfinite(wide) ||
+            std::abs(wide) > std::numeric_limits<T>::max())
+            return false;
+        const T candidate = static_cast<T>(wide);
+        if (!std::isfinite(candidate) ||
+            (candidate == 0 &&
+             token.substr(0, token.find_first_of("eE")).find_first_of("123456789") !=
+                 std::string::npos))
+            return false;
+        *value = candidate;
+        return true;
+    }
+}
 
 bool EndsWith(const std::string& text, const std::string& suffix) {
     return text.size() >= suffix.size() &&
@@ -51,11 +123,7 @@ bool ParseDouble(std::string_view text, double* value) {
     if (token.empty() || value == nullptr) {
         return false;
     }
-    const auto parsed = std::from_chars(token.data(), token.data() + token.size(), *value);
-    if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size()) {
-        return false;
-    }
-    return std::isfinite(*value);
+    return ParseFloating(token, value);
 }
 
 bool ParseInt64(std::string_view text, std::int64_t* value) {

@@ -1,7 +1,9 @@
 #include "check.hpp"
 #include "record_helper/euroc_format.hpp"
 
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -145,8 +147,8 @@ RH_TEST(euroc_format_reads_block_sequence) {
 
     // 仍然要拒的：元素数与 rows/cols 不符（理由必须是数量不匹配，不是语法不认识）、
     // 以及无空格负数混进块里（那不是合法项标记）。
-    CHECK(rh::fmt::WriteWholeFile(path, "T_BS:\n  cols: 4\n  rows: 4\n  data:\n  - 1.0\n  - 2.0\n",
-                                  &error));
+    CHECK(rh::fmt::WriteWholeFile(
+        path, "T_BS:\n  cols: 4\n  rows: 4\n  data:\n  - 1.0\n  - 2.0\n", &error));
     CHECK(!rh::fmt::ReadYamlBlock(path, "T_BS", &block, &error));
     CHECK(rh::fmt::WriteWholeFile(
         path, "T_BS:\n  cols: 1\n  rows: 2\n  data:\n  - 1.0\n-0.5\n", &error));
@@ -230,4 +232,20 @@ RH_TEST(euroc_format_paths) {
     CHECK(!rh::fmt::ReadWholeFile(rh::fmt::JoinPath(deep, "missing.csv"), &content, &error));
     CHECK(rh::fmt::JoinPath("/tmp/", "a") == "/tmp/a");
     CHECK(rh::fmt::JoinPath("/tmp", "") == "/tmp");
+}
+
+RH_TEST(euroc_decimal_parser_gcc10_range_and_strictness) {
+    double v = 0;
+    CHECK(rh::fmt::ParseDouble("4.9406564584124654e-324", &v));
+    CHECK(v == std::numeric_limits<double>::denorm_min());
+    CHECK(!rh::fmt::ParseDouble("1e-9999", &v));
+    CHECK(!rh::fmt::ParseDouble("1e9999", &v));
+    CHECK(!rh::fmt::ParseDouble("1,25", &v));
+    CHECK(!rh::fmt::ParseDouble("1 e2", &v));
+    CHECK(!rh::fmt::ParseDouble("0x1p2", &v));
+    CHECK(!rh::fmt::ParseDouble("1e+", &v));
+    CHECK(rh::fmt::ParseDouble("-.5", &v));
+    CHECK(v == -0.5);
+    CHECK(rh::fmt::ParseDouble("-0", &v));
+    CHECK(std::signbit(v));
 }

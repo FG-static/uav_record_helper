@@ -23,7 +23,10 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 find_package(Eigen3 CONFIG REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
-find_package(realsense2 CONFIG REQUIRED)
+option(RH_WITH_REALSENSE "Build the original RealSense capture backend" ON)
+if(RH_WITH_REALSENSE)
+    find_package(realsense2 CONFIG REQUIRED)
+endif()
 
 add_library(record_helper_format STATIC
     src/record_helper/png_io.cpp
@@ -34,20 +37,24 @@ add_library(record_helper_format STATIC
     src/record_helper/dataset_writer.cpp
     src/record_helper/verify.cpp)
 target_include_directories(record_helper_format PUBLIC include)
-target_link_libraries(record_helper_format PUBLIC Eigen3::Eigen ZLIB::ZLIB)
+target_link_libraries(record_helper_format PUBLIC Eigen3::Eigen ZLIB::ZLIB Threads::Threads)
 
 # 设备访问单独成层：无 SDK/无权限的环境下也能构建 format 层与校验器。
-add_library(record_helper_capture STATIC
-    src/record_helper/capture.cpp)
-target_include_directories(record_helper_capture PUBLIC include)
-target_link_libraries(record_helper_capture PUBLIC record_helper_format realsense2::realsense2 Threads::Threads)
-
-add_executable(rh
-    src/record_helper/main.cpp
-    src/record_helper/cli_common.cpp
-    src/record_helper/cli_probe.cpp
-    src/record_helper/cli_record.cpp)
-target_link_libraries(rh PRIVATE record_helper_capture)
+if(RH_WITH_REALSENSE)
+    add_library(record_helper_capture STATIC src/record_helper/capture.cpp)
+    target_include_directories(record_helper_capture PUBLIC include)
+    target_link_libraries(record_helper_capture PUBLIC record_helper_format realsense2::realsense2 Threads::Threads)
+    set(RH_DEVICE_CLI src/record_helper/cli_probe.cpp src/record_helper/cli_record.cpp)
+else()
+    set(RH_DEVICE_CLI src/record_helper/cli_realsense_unavailable.cpp)
+endif()
+add_executable(rh src/record_helper/main.cpp src/record_helper/cli_common.cpp
+    src/record_helper/csi_dispatch.cpp ${RH_DEVICE_CLI})
+target_link_libraries(rh PRIVATE record_helper_format Threads::Threads)
+if(RH_WITH_REALSENSE)
+    target_link_libraries(rh PRIVATE record_helper_capture)
+endif()
+target_compile_definitions(rh PRIVATE RH_CSI_HELPER_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tools/rh_csi_mavlink.py")
 set_target_properties(rh PROPERTIES OUTPUT_NAME "rh")
 # Linux 就是这个 rh。macOS 下面再包成 .app。录制请用 Linux：当前 SDK 在 macOS 上不枚举 IMU。
 
@@ -94,3 +101,9 @@ add_executable(rh_format_tests
 target_include_directories(rh_format_tests PRIVATE tests src/record_helper)
 target_link_libraries(rh_format_tests PRIVATE record_helper_format)
 add_test(NAME format.contract COMMAND rh_format_tests)
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME csi.contract COMMAND ${Python3_EXECUTABLE} -B -m unittest discover
+    -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_csi_mavlink.py)
+set_tests_properties(csi.contract PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/tools")
+add_test(NAME csi.cli_help COMMAND rh record --backend csi-mavlink --help)

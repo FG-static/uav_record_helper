@@ -361,7 +361,8 @@ RH_TEST(verify_flags_hand_written_timeshift) {
         std::string content;
         std::string error;
         CHECK(rh::fmt::ReadWholeFile(path, &content, &error));
-        CHECK(rh::fmt::WriteWholeFile(path, content + "timeshift_to_imu_ms: 6.0  # 实测\n", &error));
+        CHECK(
+            rh::fmt::WriteWholeFile(path, content + "timeshift_to_imu_ms: 6.0  # 实测\n", &error));
         const auto report = rh::VerifyDataset(root, FixtureOptions());
         CHECK(HasFailing(report, "camera.timeshift"));
         CHECK(!report.ok());
@@ -401,19 +402,30 @@ RH_TEST(verify_flags_hand_written_timeshift) {
     {
         // 干净的录制产物不产生这条检查。
         const auto report = rh::VerifyDataset(Fixture().valid_root(), FixtureOptions());
-        CHECK(report.checks.end() ==
-              std::find_if(report.checks.begin(),
-                           report.checks.end(),
-                           [](const rh::CheckResult& check) {
-                               return check.id == "camera.timeshift";
-                           }));
+        CHECK(report.checks.end() == std::find_if(report.checks.begin(),
+                                                  report.checks.end(),
+                                                  [](const rh::CheckResult& check) {
+                                                      return check.id == "camera.timeshift";
+                                                  }));
     }
 }
 
-RH_TEST(verify_rejects_missing_layout) {    const rh::testing::TempDirectory temp("rh-verify-empty");
+RH_TEST(verify_rejects_missing_layout) {
+    const rh::testing::TempDirectory temp("rh-verify-empty");
     const auto report = rh::VerifyDataset(temp.path(), FixtureOptions());
     CHECK(HasFailing(report, "layout"));
     CHECK(!report.ok());
     const auto missing = rh::VerifyDataset("/tmp/rh-definitely-not-a-dataset", FixtureOptions());
     CHECK(HasFailing(missing, "layout"));
+}
+
+RH_TEST(verify_does_not_certify_software_paired_rolling_capture) {
+    const std::string root = Fixture().Copy("csi-contract");
+    std::string error;
+    CHECK(rh::fmt::WriteWholeFile(rh::fmt::JoinPath(root, "record_summary.yaml"),
+                                  "recorder_backend: csi-mavlink\nreplay_ready: false\n",
+                                  &error));
+    const auto report = rh::VerifyDataset(root, FixtureOptions());
+    CHECK(HasFailing(report, "capture.physical_contract"));
+    CHECK(!report.ok());
 }

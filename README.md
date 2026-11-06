@@ -421,3 +421,11 @@ python3 tools/rh_gui.py --smoke    # 构造界面 1.5 s 后自动关闭，验证
 
 本仓库不使用、也不复制 `unav_vio` 或 VINS 的任何源码；`verify`/`motion_gate` 里那些阈值和
 解析规则是**按行为重新实现**的，判据出处逐条记在 `docs/format-contract.md`。
+
+## RK3588 CSI 双目与 MAVLink IMU
+
+新增独立的 `csi-mavlink` 后端：`rh record/probe --backend csi-mavlink --config config/rk3588-csi-mavlink.json`。
+Linux 构建可设置 `-DRH_WITH_REALSENSE=OFF`，无需安装 RealSense SDK。采集无损原始灰度图像和飞控
+HIGHRES_IMU，保留软件配对前的双路时间戳、飞控原始时刻、TIMESYNC与卷帘时序，导出EuRoC风格CSV。
+实测标定可以后补；不编造内外参、GT或高频IMU，不把软件配对认证为硬同步。
+完整环境、录制、标定导入和回放限制见 [CSI/MAVLink 后端](docs/csi-mavlink.md)。
